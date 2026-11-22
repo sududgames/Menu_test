@@ -1,3 +1,8 @@
+#include "Includes/obfuscate.h"
+#include "Menu/Menu.hpp"
+#include "Utils.hpp"
+#include "Includes/Logger.h"
+
 int RegisterMenu(JNIEnv *env) {
     JNINativeMethod methods[] = {
             {OBFUSCATE("Icon"),            OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(Icon)},
@@ -37,11 +42,11 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
     if (vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK)
         return JNI_ERR;
 
-    // Регистрация может не удаться, пока Java-классов меню нет в процессе —
-    // это не критично: игра продолжит работать, попробуем позже ещё раз.
+    // Классы меню могут отсутствовать в процессе игры — это не критично:
+    // игра продолжит работать, регистрация просто пропустится.
     RegisterMenu(env);
     RegisterPreferences(env);
     RegisterMain(env);
 
-    return JNI_VERSION_1_6;  // никогда не возвращаем JNI_ERR
+    return JNI_VERSION_1_6; // никогда не возвращаем JNI_ERR
 }
