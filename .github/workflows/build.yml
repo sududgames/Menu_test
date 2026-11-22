@@ -19,7 +19,7 @@ jobs:
 
       - name: Restore gradle wrapper jar
         run: |
-          GRADLE_VER=$(sed -n 's/.*gradle-$.*$-bin.zip/\1/p' gradle/wrapper/gradle-wrapper.properties)
+          GRADLE_VER=$(grep -oP 'gradle-\K[0-9.]+' gradle/wrapper/gradle-wrapper.properties)
           echo "Gradle version: $GRADLE_VER"
           wget -q "https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VER}/gradle/wrapper/gradle-wrapper.jar" -O gradle/wrapper/gradle-wrapper.jar
           chmod +x gradlew
@@ -31,3 +31,4 @@ jobs:
         with:
           name: mod-menu-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
