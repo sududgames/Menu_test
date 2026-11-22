@@ -1,3 +1,5 @@
+
+
 name: Build Mod Menu
 on: [push, workflow_dispatch]
 
@@ -17,18 +19,14 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1"
 
-      - name: Restore gradle wrapper jar
-        run: |
-          GRADLE_VER=$(grep -oP 'gradle-\K[0-9.]+' gradle/wrapper/gradle-wrapper.properties)
-          echo "Gradle version: $GRADLE_VER"
-          wget -q "https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VER}/gradle/wrapper/gradle-wrapper.jar" -O gradle/wrapper/gradle-wrapper.jar
-          chmod +x gradlew
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
 
       - name: Build APK
-        run: ./gradlew assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon
 
       - uses: actions/upload-artifact@v4
         with:
           name: mod-menu-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-
