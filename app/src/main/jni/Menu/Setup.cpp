@@ -13,8 +13,11 @@ int RegisterMenu(JNIEnv *env) {
             {OBFUSCATE("GetFeatureList"),  OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(GetFeatureList)},
     };
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!clazz) { LOGW(OBFUSCATE("Menu class not found")); return -1; }
-    return env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    int res = env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return res;
 }
 
 int RegisterPreferences(JNIEnv *env) {
@@ -22,8 +25,11 @@ int RegisterPreferences(JNIEnv *env) {
             {OBFUSCATE("Changes"), OBFUSCATE("(Landroid/content/Context;ILjava/lang/String;IJZLjava/lang/String;)V"), reinterpret_cast<void *>(Changes)},
     };
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Preferences"));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!clazz) { LOGW(OBFUSCATE("Preferences class not found")); return -1; }
-    return env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    int res = env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return res;
 }
 
 int RegisterMain(JNIEnv *env) {
@@ -31,8 +37,11 @@ int RegisterMain(JNIEnv *env) {
             {OBFUSCATE("CheckOverlayPermission"), OBFUSCATE("(Landroid/content/Context;)V"), reinterpret_cast<void *>(CheckOverlayPermission)},
     };
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Main"));
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!clazz) { LOGW(OBFUSCATE("Main class not found")); return -1; }
-    return env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    int res = env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0]));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return res;
 }
 
 extern "C"
@@ -42,11 +51,13 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
     if (vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK)
         return JNI_ERR;
 
-    // Классы меню могут отсутствовать в процессе игры — это не критично:
-    // игра продолжит работать, регистрация просто пропустится.
+    // Классы меню в игровом процессе могут отсутствовать — это нормально.
+    // Все исключения очищаются, игра продолжает работать без меню.
     RegisterMenu(env);
     RegisterPreferences(env);
     RegisterMain(env);
 
-    return JNI_VERSION_1_6; // никогда не возвращаем JNI_ERR
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    return JNI_VERSION_1_6;
 }
