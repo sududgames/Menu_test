@@ -31,6 +31,16 @@ typedef float (*get_timeScale_t)();
 
 static set_timeScale_t set_timeScale = nullptr;
 static get_timeScale_t get_timeScale = nullptr;
+static get_timeScale_t orig_get_timeScale = nullptr;
+
+// Хук геттера: пока тумблер включён — отдаём наше значение всем читателям
+// (и managed-коду, и нативному движку), включая отрицательные.
+// Так мы обходим нативный сеттер, который режет минус до нуля.
+static float hooked_get_timeScale() {
+    if (timescaleOn.load(std::memory_order_relaxed))
+        return timescale.load(std::memory_order_relaxed);
+    return orig_get_timeScale();
+}
 
 static void ResolveTimeScale() {
     void *handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_GLOBAL);
@@ -41,17 +51,30 @@ static void ResolveTimeScale() {
 
     set_timeScale = (set_timeScale_t) resolve(OBFUSCATE("UnityEngine.Time::set_timeScale"));
     get_timeScale = (get_timeScale_t) resolve(OBFUSCATE("UnityEngine.Time::get_timeScale"));
+
+    // Хук геттера — единственный способ провести минус через Unity:
+    // нативный сеттер обрезает отрицательный timeScale до 0.
+    if (get_timeScale)
+        DobbyHook((void*) get_timeScale, (void*) hooked_get_timeScale,
+                  (void**) &orig_get_timeScale);
 }
 
-// Фоновый поток: держит timeScale, пока включён тумблер (аналог setInterval из скрипта)
+// Сеттер вызываем только для неотрицательных — он держит внутреннее
+// состояние движка согласованным. Отрицательные отдаёт хук геттера.
+static void ApplyTimeScale(float v) {
+    if (set_timeScale && v >= 0.0f)
+        set_timeScale(v);
+}
+
+// Фоновый поток: синхронизирует внутреннее состояние, пока включён тумблер
 static void TimeScaleKeepAlive() {
     while (!set_timeScale) {
         ResolveTimeScale();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     while (true) {
-        if (timescaleOn && set_timeScale)
-            set_timeScale(timescale);
+        if (timescaleOn)
+            ApplyTimeScale(timescale.load());
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
 }
@@ -88,12 +111,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
     switch (featNum) {
         case 0: // Toggle_TimeScale enabled
             timescaleOn = boolean;
-            if (!timescaleOn && set_timeScale)
-                set_timeScale(1.0f);   // off(): возврат к нормальной скорости
+            if (!timescaleOn)
+                ApplyTimeScale(1.0f);   // off(): возврат к нормальной скорости
             break;
 
         case 1: // SeekBar: 1..100 -> 0.1..10.0
             timescale = value / 10.0f;
+            ApplyTimeScale(timescale.load());
             break;
 
         case 2: { // InputText: ручной ввод без ограничений
@@ -108,6 +132,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
 
                 float v = strtof(s.c_str(), nullptr);
                 timescale = v; // любое значение: минус, дробь, без ограничений
+                ApplyTimeScale(timescale.load());
             }
             break;
         }
@@ -123,7 +148,7 @@ void hack_thread() {
         sleep(1);
     }
 
-    // TimeScale: резолв icall-ов + фоновый поток поддержки
+    // TimeScale: резолв icall-ов + хук геттера + фоновый поток
     ResolveTimeScale();
     std::thread(TimeScaleKeepAlive).detach();
 
