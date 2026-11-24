@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <string>
+#include <algorithm>
 #include <jni.h>
 #include <unistd.h>
 #include <fstream>
@@ -95,16 +96,18 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
             timescale = value / 10.0f;
             break;
 
-        case 2: { // InputText: ручной ввод с минусом и дробью
+        case 2: { // InputText: ручной ввод без ограничений
             if (!text) break;
             const char *str = env->GetStringUTFChars(text, nullptr);
             if (str) {
-                float v = strtof(str, nullptr);
+                std::string s(str);
                 env->ReleaseStringUTFChars(text, str);
 
-                if (v >= -100.0f && v <= 100.0f)  // защита от случайного 99999
-                    timescale = v;
-                // невалидный/пустой ввод игнорируется — скорость не меняется
+                // русская раскладка вводит "0,5" — приводим к "0.5"
+                std::replace(s.begin(), s.end(), ',', '.');
+
+                float v = strtof(s.c_str(), nullptr);
+                timescale = v; // любое значение: минус, дробь, без ограничений
             }
             break;
         }
