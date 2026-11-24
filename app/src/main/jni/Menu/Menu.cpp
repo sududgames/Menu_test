@@ -3,12 +3,12 @@
 
 void Init(JNIEnv *env, jobject thiz, jobject ctx, jobject title, jobject subtitle) {
     //Set sub title
-    setText(env, title, OBFUSCATE("<b>Modded by (yourname)</b>"));
+    setText(env, title, OBFUSCATE("<b>Modded by (SUDUD)</b>"));
 
     //Set sub title
     setText(env, subtitle, OBFUSCATE("<b><marquee><p style=\"font-size:30\">"
                                      "<p style=\"color:green;\">Modded by LGL</p> | "
-                                     "https://github.com/LGLTeam | Lorem Ipsum is simply dummy text of the printing and typesetting</p>"
+                                     "SPRING SECRET 2,it's virus </p>"
                                      "</marquee></b>"));
 
     //Dialog Example
@@ -22,7 +22,7 @@ void Init(JNIEnv *env, jobject thiz, jobject ctx, jobject title, jobject subtitl
            OBFUSCATE("https://github.com/LGLTeam")); // set nullptr if btn-link is not needed
 
     //Toast Example
-    Toast(env, ctx, OBFUSCATE("Modded by YOU"), ToastLength::LENGTH_LONG);
+    Toast(env, ctx, OBFUSCATE("Modded by SUDUD"), ToastLength::LENGTH_LONG);
 }
 
 jstring Icon(JNIEnv *env, jobject thiz) {
