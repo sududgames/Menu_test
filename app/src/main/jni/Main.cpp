@@ -8,13 +8,13 @@
 #include <chrono>
 #include <string>
 #include <algorithm>
+#include <cstdio>
 #include <jni.h>
 #include <unistd.h>
 #include <fstream>
 #include <iostream>
 #include <dlfcn.h>
 #include "Includes/Logger.h"
-#include "Includes/obfuscate.h"
 #include "Includes/obfuscate.h"
 #include "Includes/Utils.hpp"
 #include "Menu/Menu.hpp"
@@ -88,13 +88,6 @@ static void ApplyTimeScale(float v) {
         il2cpp_field_static_set_value(timeScaleField, &v);
 }
 
-static float ReadTimeScale() {
-    float v = 1.0f;
-    if (timeScaleField && il2cpp_field_static_get_value)
-        il2cpp_field_static_get_value(timeScaleField, &v);
-    return v;
-}
-
 // Фоновый поток: пока тумблер включён — держим наше значение в поле,
 // даже если игра сама перезапишет timeScale через обычный сеттер.
 static void TimeScaleKeepAlive() {
@@ -115,11 +108,17 @@ static void TimeScaleKeepAlive() {
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     jobjectArray ret;
 
+    // Динамическая подпись: показывает текущее значение timescale,
+    // включая вручную заданное (минус и дроби)
+    char customLabel[64];
+    snprintf(customLabel, sizeof(customLabel),
+             "2_InputText_Custom speed (now: %.2f)", timescale.load());
+
     const char *features[] = {
-            OBFUSCATE("Category_TimeScale"),                          // не нумеруется
-            OBFUSCATE("0_Toggle_TimeScale enabled"),                  // case 0
-            OBFUSCATE("1_SeekBar_Speed x0.1-x10_1_100"),              // case 1 (значение /10)
-            OBFUSCATE("2_InputText_Custom speed (e.g. -0.75 or 2.5)") // case 2
+            OBFUSCATE("Category_TimeScale"),                 // не нумеруется
+            OBFUSCATE("0_Toggle_TimeScale enabled"),         // case 0
+            OBFUSCATE("1_SeekBar_Speed x0.1-x10_1_100"),     // case 1 (значение /10)
+            customLabel                                      // case 2
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -161,7 +160,8 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
                 std::replace(s.begin(), s.end(), ',', '.');
 
                 float v = strtof(s.c_str(), nullptr);
-                timescale = v; // любое значение: минус, дробь, без ограничений
+                timescale = v;      // любое значение: минус, дробь, без ограничений
+                timescaleOn = true; // ввод значения = тумблер включён
                 ApplyTimeScale(timescale.load());
             }
             break;
