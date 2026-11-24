@@ -17,87 +17,56 @@
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 #include "Includes/Utils.hpp"
+#include "Includes/Dobby.h"   // путь поправь под свой шаблон, если отличается
 #include "Menu/Menu.hpp"
 #include "Menu/Jni.hpp"
 #include "Includes/Macros.h"
 
-// ===================== TimeScale: прямая запись в статическое поле =====================
+// ===================== TimeScale: хук set_timeScale =====================
 
 static std::atomic<bool> timescaleOn{false};
 static std::atomic<float> timescale{1.0f};
+static std::atomic<bool> hookInstalled{false};
 
-// il2cpp API
-typedef void* (*il2cpp_domain_get_t)();
-typedef void** (*il2cpp_domain_get_assemblies_t)(void*, size_t*);
-typedef void* (*il2cpp_assembly_get_image_t)(void*);
-typedef void* (*il2cpp_class_from_name_t)(void*, const char*, const char*);
-typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
-typedef void  (*il2cpp_field_static_set_value_t)(void*, void*);
-typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
+typedef void* (*il2cpp_resolve_icall_t)(const char*);
+static il2cpp_resolve_icall_t il2cpp_resolve_icall = nullptr;
 
-static il2cpp_domain_get_t              il2cpp_domain_get = nullptr;
-static il2cpp_domain_get_assemblies_t   il2cpp_domain_get_assemblies = nullptr;
-static il2cpp_assembly_get_image_t      il2cpp_assembly_get_image = nullptr;
-static il2cpp_class_from_name_t         il2cpp_class_from_name = nullptr;
-static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = nullptr;
-static il2cpp_field_static_set_value_t  il2cpp_field_static_set_value = nullptr;
-static il2cpp_field_static_get_value_t  il2cpp_field_static_get_value = nullptr;
+typedef void (*set_timeScale_t)(float);
+static set_timeScale_t old_set_timeScale = nullptr;
 
-static void* timeScaleField = nullptr; // FieldInfo* UnityEngine.Time::timeScale
+// Хук: пока тумблер включён — любое обращение игры к set_timeScale
+// заменяется нашим значением. Выключен — игра живёт своей жизнью.
+static void _set_timeScale(float value) {
+    if (!old_set_timeScale) return;
+    if (timescaleOn.load())
+        old_set_timeScale(timescale.load());
+    else
+        old_set_timeScale(value);
+}
 
-static bool ResolveIl2Cpp() {
+static void InstallTimeScaleHook() {
     void *handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!handle) return false;
+    if (!handle) return;
 
-    il2cpp_domain_get              = (il2cpp_domain_get_t) dlsym(handle, "il2cpp_domain_get");
-    il2cpp_domain_get_assemblies   = (il2cpp_domain_get_assemblies_t) dlsym(handle, "il2cpp_domain_get_assemblies");
-    il2cpp_assembly_get_image      = (il2cpp_assembly_get_image_t) dlsym(handle, "il2cpp_assembly_get_image");
-    il2cpp_class_from_name         = (il2cpp_class_from_name_t) dlsym(handle, "il2cpp_class_from_name");
-    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t) dlsym(handle, "il2cpp_class_get_field_from_name");
-    il2cpp_field_static_set_value  = (il2cpp_field_static_set_value_t) dlsym(handle, "il2cpp_field_static_set_value");
-    il2cpp_field_static_get_value  = (il2cpp_field_static_get_value_t) dlsym(handle, "il2cpp_field_static_get_value");
+    il2cpp_resolve_icall = (il2cpp_resolve_icall_t) dlsym(handle, "il2cpp_resolve_icall");
+    if (!il2cpp_resolve_icall) return;
 
-    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies || !il2cpp_assembly_get_image ||
-        !il2cpp_class_from_name || !il2cpp_class_get_field_from_name ||
-        !il2cpp_field_static_set_value || !il2cpp_field_static_get_value)
-        return false;
-
-    // Ищем класс UnityEngine.Time среди всех сборок
-    void *domain = il2cpp_domain_get();
-    if (!domain) return false;
-
-    size_t count = 0;
-    void **assemblies = il2cpp_domain_get_assemblies(domain, &count);
-    if (!assemblies) return false;
-
-    for (size_t i = 0; i < count; i++) {
-        void *image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        void *klass = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("Time"));
-        if (!klass) continue;
-
-        timeScaleField = il2cpp_class_get_field_from_name(klass, OBFUSCATE("timeScale"));
-        if (timeScaleField) return true;
+    void *fn = il2cpp_resolve_icall(OBFUSCATE("UnityEngine.Time::set_timeScale"));
+    if (!fn) {
+        LOGI(OBFUSCATE("set_timeScale not found"));
+        return;
     }
-    return false;
+
+    DobbyHook(fn, (void *) _set_timeScale, (void **) &old_set_timeScale);
+    hookInstalled = true;
+    LOGI(OBFUSCATE("TimeScale hook installed"));
 }
 
-// Пишем в поле напрямую: никаких clamp-ов, минус проходит как есть
-static void ApplyTimeScale(float v) {
-    if (timeScaleField && il2cpp_field_static_set_value)
-        il2cpp_field_static_set_value(timeScaleField, &v);
-}
-
-// Фоновый поток: пока тумблер включён — держим наше значение в поле,
-// даже если игра сама перезапишет timeScale через обычный сеттер.
+// Поддержка: если игра редко трогает timeScale — периодически применяем сами
 static void TimeScaleKeepAlive() {
-    while (!timeScaleField) {
-        ResolveIl2Cpp();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
     while (true) {
-        if (timescaleOn)
-            ApplyTimeScale(timescale.load());
+        if (timescaleOn.load() && hookInstalled.load() && old_set_timeScale)
+            old_set_timeScale(timescale.load());
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
 }
@@ -108,8 +77,7 @@ static void TimeScaleKeepAlive() {
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     jobjectArray ret;
 
-    // Динамическая подпись: показывает текущее значение timescale,
-    // включая вручную заданное (минус и дроби)
+    // Динамическая подпись: показывает текущее значение timescale
     char customLabel[64];
     snprintf(customLabel, sizeof(customLabel),
              "2_InputText_Custom speed (now: %.2f)", timescale.load());
@@ -140,13 +108,17 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
     switch (featNum) {
         case 0: // Toggle_TimeScale enabled
             timescaleOn = boolean;
-            if (!timescaleOn)
-                ApplyTimeScale(1.0f);   // off(): возврат к нормальной скорости
+            if (!timescaleOn && hookInstalled.load() && old_set_timeScale) {
+                timescale = 1.0f;
+                old_set_timeScale(1.0f);   // off(): возврат к нормальной скорости
+            }
             break;
 
         case 1: // SeekBar: 1..100 -> 0.1..10.0
             timescale = value / 10.0f;
-            ApplyTimeScale(timescale.load());
+            timescaleOn = true;
+            if (hookInstalled.load() && old_set_timeScale)
+                old_set_timeScale(timescale.load());
             break;
 
         case 2: { // InputText: ручной ввод без ограничений
@@ -160,9 +132,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
                 std::replace(s.begin(), s.end(), ',', '.');
 
                 float v = strtof(s.c_str(), nullptr);
-                timescale = v;      // любое значение: минус, дробь, без ограничений
+                timescale = v;      // любое значение, включая минус и дроби
                 timescaleOn = true; // ввод значения = тумблер включён
-                ApplyTimeScale(timescale.load());
+                if (hookInstalled.load() && old_set_timeScale)
+                    old_set_timeScale(v);
             }
             break;
         }
@@ -178,7 +151,7 @@ void hack_thread() {
         sleep(1);
     }
 
-    ResolveIl2Cpp();
+    InstallTimeScaleHook();
     std::thread(TimeScaleKeepAlive).detach();
 
     LOGI(OBFUSCATE("Done"));
