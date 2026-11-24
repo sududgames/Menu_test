@@ -15,61 +15,91 @@
 #include <dlfcn.h>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
+#include "Includes/obfuscate.h"
 #include "Includes/Utils.hpp"
 #include "Menu/Menu.hpp"
 #include "Menu/Jni.hpp"
 #include "Includes/Macros.h"
-#include "dobby.h"
 
-// ===================== TimeScale (перенос из Frida-скрипта) =====================
+// ===================== TimeScale: прямая запись в статическое поле =====================
 
 static std::atomic<bool> timescaleOn{false};
 static std::atomic<float> timescale{1.0f};
 
-typedef void (*set_timeScale_t)(float);
-typedef float (*get_timeScale_t)();
+// il2cpp API
+typedef void* (*il2cpp_domain_get_t)();
+typedef void** (*il2cpp_domain_get_assemblies_t)(void*, size_t*);
+typedef void* (*il2cpp_assembly_get_image_t)(void*);
+typedef void* (*il2cpp_class_from_name_t)(void*, const char*, const char*);
+typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
+typedef void  (*il2cpp_field_static_set_value_t)(void*, void*);
+typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
 
-static set_timeScale_t set_timeScale = nullptr;
-static get_timeScale_t get_timeScale = nullptr;
-static get_timeScale_t orig_get_timeScale = nullptr;
+static il2cpp_domain_get_t              il2cpp_domain_get = nullptr;
+static il2cpp_domain_get_assemblies_t   il2cpp_domain_get_assemblies = nullptr;
+static il2cpp_assembly_get_image_t      il2cpp_assembly_get_image = nullptr;
+static il2cpp_class_from_name_t         il2cpp_class_from_name = nullptr;
+static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = nullptr;
+static il2cpp_field_static_set_value_t  il2cpp_field_static_set_value = nullptr;
+static il2cpp_field_static_get_value_t  il2cpp_field_static_get_value = nullptr;
 
-// Хук геттера: пока тумблер включён — отдаём наше значение всем читателям
-// (и managed-коду, и нативному движку), включая отрицательные.
-// Так мы обходим нативный сеттер, который режет минус до нуля.
-static float hooked_get_timeScale() {
-    if (timescaleOn.load(std::memory_order_relaxed))
-        return timescale.load(std::memory_order_relaxed);
-    return orig_get_timeScale();
-}
+static void* timeScaleField = nullptr; // FieldInfo* UnityEngine.Time::timeScale
 
-static void ResolveTimeScale() {
+static bool ResolveIl2Cpp() {
     void *handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!handle) return;
+    if (!handle) return false;
 
-    auto resolve = (void* (*)(const char*)) dlsym(handle, "il2cpp_resolve_icall");
-    if (!resolve) return;
+    il2cpp_domain_get              = (il2cpp_domain_get_t) dlsym(handle, "il2cpp_domain_get");
+    il2cpp_domain_get_assemblies   = (il2cpp_domain_get_assemblies_t) dlsym(handle, "il2cpp_domain_get_assemblies");
+    il2cpp_assembly_get_image      = (il2cpp_assembly_get_image_t) dlsym(handle, "il2cpp_assembly_get_image");
+    il2cpp_class_from_name         = (il2cpp_class_from_name_t) dlsym(handle, "il2cpp_class_from_name");
+    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t) dlsym(handle, "il2cpp_class_get_field_from_name");
+    il2cpp_field_static_set_value  = (il2cpp_field_static_set_value_t) dlsym(handle, "il2cpp_field_static_set_value");
+    il2cpp_field_static_get_value  = (il2cpp_field_static_get_value_t) dlsym(handle, "il2cpp_field_static_get_value");
 
-    set_timeScale = (set_timeScale_t) resolve(OBFUSCATE("UnityEngine.Time::set_timeScale"));
-    get_timeScale = (get_timeScale_t) resolve(OBFUSCATE("UnityEngine.Time::get_timeScale"));
+    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies || !il2cpp_assembly_get_image ||
+        !il2cpp_class_from_name || !il2cpp_class_get_field_from_name ||
+        !il2cpp_field_static_set_value || !il2cpp_field_static_get_value)
+        return false;
 
-    // Хук геттера — единственный способ провести минус через Unity:
-    // нативный сеттер обрезает отрицательный timeScale до 0.
-    if (get_timeScale)
-        DobbyHook((void*) get_timeScale, (void*) hooked_get_timeScale,
-                  (void**) &orig_get_timeScale);
+    // Ищем класс UnityEngine.Time среди всех сборок
+    void *domain = il2cpp_domain_get();
+    if (!domain) return false;
+
+    size_t count = 0;
+    void **assemblies = il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies) return false;
+
+    for (size_t i = 0; i < count; i++) {
+        void *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        void *klass = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("Time"));
+        if (!klass) continue;
+
+        timeScaleField = il2cpp_class_get_field_from_name(klass, OBFUSCATE("timeScale"));
+        if (timeScaleField) return true;
+    }
+    return false;
 }
 
-// Сеттер вызываем только для неотрицательных — он держит внутреннее
-// состояние движка согласованным. Отрицательные отдаёт хук геттера.
+// Пишем в поле напрямую: никаких clamp-ов, минус проходит как есть
 static void ApplyTimeScale(float v) {
-    if (set_timeScale && v >= 0.0f)
-        set_timeScale(v);
+    if (timeScaleField && il2cpp_field_static_set_value)
+        il2cpp_field_static_set_value(timeScaleField, &v);
 }
 
-// Фоновый поток: синхронизирует внутреннее состояние, пока включён тумблер
+static float ReadTimeScale() {
+    float v = 1.0f;
+    if (timeScaleField && il2cpp_field_static_get_value)
+        il2cpp_field_static_get_value(timeScaleField, &v);
+    return v;
+}
+
+// Фоновый поток: пока тумблер включён — держим наше значение в поле,
+// даже если игра сама перезапишет timeScale через обычный сеттер.
 static void TimeScaleKeepAlive() {
-    while (!set_timeScale) {
-        ResolveTimeScale();
+    while (!timeScaleField) {
+        ResolveIl2Cpp();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     while (true) {
@@ -148,8 +178,7 @@ void hack_thread() {
         sleep(1);
     }
 
-    // TimeScale: резолв icall-ов + хук геттера + фоновый поток
-    ResolveTimeScale();
+    ResolveIl2Cpp();
     std::thread(TimeScaleKeepAlive).detach();
 
     LOGI(OBFUSCATE("Done"));
