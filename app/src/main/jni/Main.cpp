@@ -1,16 +1,21 @@
+// Main.cpp — TexMod: дамп и подмена текстур через il2cpp API
+// Точка входа: конструктор lib_main (без привязки к smali)
+// Контракт с меню: GetFeatureList / Changes — сигнатуры должны совпадать с Menu.hpp
+
 #include <jni.h>
 #include <string>
 #include <vector>
+#include <set>
+#include <cstring>
+#include <cstdarg>
+#include <cctype>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <cstdio>
-#include <cstring>
-#include <cstdlib>
-#include <cctype>
-#include <cstdarg>
-#include <cstdint>
-#include <ctime>
 #include <thread>
 #include <chrono>
 #include <dlfcn.h>
@@ -24,630 +29,661 @@
 #define ANDROID_LOG_INFO 4
 #endif
 
-// ===================== Лог: logcat + файл =====================
-// Файл: /storage/emulated/0/texmod_log.txt (в корне хранилища, без папок).
-// До выдачи доступа сообщения копятся в памяти и сбрасываются в файл,
-// как только доступ появится.
+#define targetLibName OBFUSCATE("libil2cpp.so")
 
-static std::string g_logPath = "/storage/emulated/0/texmod_log.txt";
+#define DUMP_DIR  "/storage/emulated/0/texdump"
+#define APPLY_DIR "/storage/emulated/0/texmod"
+#define LOG_PATH  "/storage/emulated/0/texmod_log.txt"
+
+// ============================== лог ==============================
 static FILE* g_logFile = nullptr;
-static std::vector<std::string> g_logPending;
+static std::vector<std::string> g_logBuf;
 
-static void LogMsg(const char* fmt, ...) {
-    char buf[256];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
+static void LogFlushBuffer() {
+    if (!g_logFile) return;
+    for (size_t i = 0; i < g_logBuf.size(); i++) {
+        fputs(g_logBuf[i].c_str(), g_logFile);
+        fputc('\n', g_logFile);
+    }
+    fflush(g_logFile);
+    g_logBuf.clear();
+}
 
-    char ts[16];
+static void TxLog(const char* fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, "TEXMOD", "%s", line);
+
+    g_logBuf.push_back(line);
+    while (g_logBuf.size() > 1024) g_logBuf.erase(g_logBuf.begin());
+
+    if (!g_logFile) {
+        FILE* f = fopen(LOG_PATH, "a");
+        if (f) {
+            g_logFile = f;
+            time_t t = time(nullptr);
+            struct tm lt;
+            localtime_r(&t, &lt);
+            char ts[32];
+            strftime(ts, sizeof(ts), "%H:%M:%S", &lt);
+            fprintf(g_logFile, "===== launch %s =====\n", ts);
+            g_logBuf.push_back("storage access OK");
+        }
+    }
+    LogFlushBuffer();
+}
+
+static void TxLogTs(const char* msg) {
     time_t t = time(nullptr);
     struct tm lt;
     localtime_r(&t, &lt);
+    char ts[32];
     strftime(ts, sizeof(ts), "%H:%M:%S", &lt);
+    TxLog("%s %s", ts, msg);
+}
 
-    __android_log_print(ANDROID_LOG_INFO, "TEXMOD", "%s", buf);
+// ============================== png encoder (stored blocks) ==============================
+static uint32_t g_crcTable[256];
+static bool g_crcReady = false;
 
-    std::string line = std::string("[") + ts + "] " + buf;
-    if (g_logFile) {
-        fprintf(g_logFile, "%s\n", line.c_str());
-        fflush(g_logFile);
-    } else {
-        g_logPending.push_back(line);
+static void CrcInit() {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_crcTable[i] = c;
+    }
+    g_crcReady = true;
+}
+
+static uint32_t CrcUpdate(uint32_t crc, const uint8_t* d, size_t n) {
+    if (!g_crcReady) CrcInit();
+    for (size_t i = 0; i < n; i++) crc = g_crcTable[(crc ^ d[i]) & 0xFFu] ^ (crc >> 8);
+    return crc;
+}
+
+static void AdlerUpdate(uint32_t* s1, uint32_t* s2, const uint8_t* d, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        *s1 = (*s1 + d[i]) % 65521u;
+        *s2 = (*s2 + *s1) % 65521u;
     }
 }
 
-static void OpenLogFile() {
-    if (g_logFile) return;
-    g_logFile = fopen(g_logPath.c_str(), "a");
-    if (g_logFile) {
-        char ts[24];
-        time_t t = time(nullptr);
-        struct tm lt;
-        localtime_r(&t, &lt);
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &lt);
-        fprintf(g_logFile, "\n===== launch %s =====\n", ts);
-        for (size_t i = 0; i < g_logPending.size(); ++i)
-            fprintf(g_logFile, "%s\n", g_logPending[i].c_str());
-        fflush(g_logFile);
-        g_logPending.clear();
-    }
+static void WriteBe32(FILE* f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    fwrite(b, 1, 4, f);
 }
 
-// ===================== il2cpp API =====================
+static void WriteChunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
+    WriteBe32(f, (uint32_t)len);
+    fwrite(type, 1, 4, f);
+    if (len && data) fwrite(data, 1, len, f);
+    uint32_t crc = CrcUpdate(0xFFFFFFFFu, (const uint8_t*)type, 4);
+    if (len && data) crc = CrcUpdate(crc, data, len);
+    crc ^= 0xFFFFFFFFu;
+    WriteBe32(f, crc);
+}
+
+// PNG с несжатыми stored-блоками deflate: RGBA (w*h*4) -> валидный png
+static bool WritePngStored(FILE* f, int w, int h, const uint8_t* rgba) {
+    static const uint8_t sig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    fwrite(sig, 1, 8, f);
+
+    uint8_t ihdr[13];
+    ihdr[0] = (uint8_t)(w >> 24); ihdr[1] = (uint8_t)(w >> 16);
+    ihdr[2] = (uint8_t)(w >> 8);  ihdr[3] = (uint8_t)w;
+    ihdr[4] = (uint8_t)(h >> 24); ihdr[5] = (uint8_t)(h >> 16);
+    ihdr[6] = (uint8_t)(h >> 8);  ihdr[7] = (uint8_t)h;
+    ihdr[8] = 8;  // bit depth
+    ihdr[9] = 6;  // RGBA
+    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    WriteChunk(f, "IHDR", ihdr, 13);
+
+    size_t rowSize = 1 + (size_t)w * 4;
+    size_t payload = rowSize * (size_t)h;
+    size_t numBlocks = (payload + 65534) / 65535;
+    uint32_t idatLen = (uint32_t)(2 + payload + 5 * numBlocks + 4);
+
+    WriteBe32(f, idatLen);
+    fwrite("IDAT", 1, 4, f);
+    uint32_t crc = CrcUpdate(0xFFFFFFFFu, (const uint8_t*)"IDAT", 4);
+
+    const uint8_t zhdr[2] = { 0x78, 0x01 };
+    fwrite(zhdr, 1, 2, f);
+    crc = CrcUpdate(crc, zhdr, 2);
+
+    std::vector<uint8_t> row(rowSize);
+    uint32_t s1 = 1, s2 = 0;
+
+    for (int y = 0; y < h; y++) {
+        row[0] = 0; // filter type 0
+        memcpy(&row[1], rgba + (size_t)y * (size_t)w * 4, (size_t)w * 4);
+        AdlerUpdate(&s1, &s2, row.data(), row.size());
+
+        size_t offset = 0;
+        while (offset < rowSize) {
+            size_t blen = rowSize - offset;
+            if (blen > 65535) blen = 65535;
+            bool last = (y == h - 1) && (offset + blen == rowSize);
+            uint8_t hdr[5];
+            hdr[0] = last ? 1 : 0;
+            hdr[1] = (uint8_t)(blen & 0xFF);
+            hdr[2] = (uint8_t)((blen >> 8) & 0xFF);
+            uint16_t nlen = (uint16_t)(~(uint16_t)blen);
+            hdr[3] = (uint8_t)(nlen & 0xFF);
+            hdr[4] = (uint8_t)((nlen >> 8) & 0xFF);
+            fwrite(hdr, 1, 5, f);
+            crc = CrcUpdate(crc, hdr, 5);
+            fwrite(row.data() + offset, 1, blen, f);
+            crc = CrcUpdate(crc, row.data() + offset, blen);
+            offset += blen;
+        }
+    }
+
+    uint8_t adler[4];
+    uint32_t ad = (s2 << 16) | s1;
+    adler[0] = (uint8_t)(ad >> 24); adler[1] = (uint8_t)(ad >> 16);
+    adler[2] = (uint8_t)(ad >> 8);  adler[3] = (uint8_t)ad;
+    fwrite(adler, 1, 4, f);
+    crc = CrcUpdate(crc, adler, 4);
+    crc ^= 0xFFFFFFFFu;
+    WriteBe32(f, crc);
+
+    WriteChunk(f, "IEND", nullptr, 0);
+    return ferror(f) == 0;
+}
+
+// ============================== il2cpp API ==============================
 typedef void*  (*il2cpp_domain_get_t)();
 typedef void** (*il2cpp_domain_get_assemblies_t)(void*, size_t*);
 typedef void*  (*il2cpp_assembly_get_image_t)(void*);
+typedef const char* (*il2cpp_image_get_name_t)(void*);
 typedef void*  (*il2cpp_class_from_name_t)(void*, const char*, const char*);
 typedef void*  (*il2cpp_class_get_method_from_name_t)(void*, const char*, int);
 typedef void*  (*il2cpp_runtime_invoke_t)(void*, void*, void**, void**);
 typedef void*  (*il2cpp_thread_attach_t)(void*);
 typedef const char* (*il2cpp_string_chars_t)(void*);
-typedef uint32_t    (*il2cpp_array_length_t)(void*);
+typedef uint32_t (*il2cpp_array_length_t)(void*);
 typedef void*  (*il2cpp_array_new_t)(void*, uintptr_t);
 typedef void*  (*il2cpp_class_get_type_t)(void*);
 typedef void*  (*il2cpp_type_get_object_t)(void*);
-typedef void*  (*il2cpp_value_box_t)(void*, void*);
 
-static il2cpp_domain_get_t il2cpp_domain_get = nullptr;
-static il2cpp_domain_get_assemblies_t il2cpp_domain_get_assemblies = nullptr;
-static il2cpp_assembly_get_image_t il2cpp_assembly_get_image = nullptr;
-static il2cpp_class_from_name_t il2cpp_class_from_name = nullptr;
+static il2cpp_domain_get_t                il2cpp_domain_get = nullptr;
+static il2cpp_domain_get_assemblies_t     il2cpp_domain_get_assemblies = nullptr;
+static il2cpp_assembly_get_image_t        il2cpp_assembly_get_image = nullptr;
+static il2cpp_image_get_name_t            il2cpp_image_get_name = nullptr;
+static il2cpp_class_from_name_t           il2cpp_class_from_name = nullptr;
 static il2cpp_class_get_method_from_name_t il2cpp_class_get_method_from_name = nullptr;
-static il2cpp_runtime_invoke_t il2cpp_runtime_invoke = nullptr;
-static il2cpp_thread_attach_t il2cpp_thread_attach = nullptr;
-static il2cpp_string_chars_t il2cpp_string_chars = nullptr;
-static il2cpp_array_length_t il2cpp_array_length = nullptr;
-static il2cpp_array_new_t il2cpp_array_new = nullptr;
-static il2cpp_class_get_type_t il2cpp_class_get_type = nullptr;
-static il2cpp_type_get_object_t il2cpp_type_get_object = nullptr;
-static il2cpp_value_box_t il2cpp_value_box = nullptr;
+static il2cpp_runtime_invoke_t            il2cpp_runtime_invoke = nullptr;
+static il2cpp_thread_attach_t             il2cpp_thread_attach = nullptr;
+static il2cpp_string_chars_t              il2cpp_string_chars = nullptr;
+static il2cpp_array_length_t              il2cpp_array_length = nullptr;
+static il2cpp_array_new_t                 il2cpp_array_new = nullptr;
+static il2cpp_class_get_type_t            il2cpp_class_get_type = nullptr;
+static il2cpp_type_get_object_t           il2cpp_type_get_object = nullptr;
 
-// Классы
-static void* texKlass   = nullptr; // UnityEngine.Texture2D
-static void* resKlass   = nullptr; // UnityEngine.Resources
-static void* byteKlass  = nullptr; // System.Byte
-static void* boolKlass  = nullptr; // System.Boolean
-static void* objKlass   = nullptr; // UnityEngine.Object
-static void* imgConvKlass = nullptr; // UnityEngine.ImageConversion
+// ============================== состояние ==============================
+static void* g_domain = nullptr;
+static void* texKlass = nullptr;
+static void* imgConvKlass = nullptr;
+static void* objKlass = nullptr;
+static void* byteKlass = nullptr;
+static void* g_texType = nullptr;
 
-// Методы
-static void* mi_findAll     = nullptr; // Resources.FindObjectsOfTypeAll(Type)
-static void* mi_objGetName  = nullptr; // Object.get_name()
-static void* mi_encodePNG   = nullptr; // EncodeToPNG (стат., ImageConversion) или null
-static void* mi_loadImage   = nullptr; // LoadImage (стат., ImageConversion) или null
-static void* mi_apply       = nullptr; // Texture2D.Apply(bool,bool)
-static void* mi_isReadable  = nullptr; // Texture2D.get_isReadable()
-static void* mi_getWidth    = nullptr; // Texture2D.get_width()
-static void* mi_getHeight   = nullptr; // Texture2D.get_height()
-static void* mi_getPixels32 = nullptr; // Texture2D.GetPixels32()
+static void* mi_findAll = nullptr;
+static void* mi_encodePNG = nullptr;
+static bool  mi_encodeStatic = false;
+static void* mi_loadImage = nullptr;
+static bool  mi_loadStatic = false;
+static void* mi_loadRaw = nullptr;
+static void* mi_apply = nullptr;
+static void* mi_isReadable = nullptr;
+static void* mi_getName = nullptr;
+static void* mi_getWidth = nullptr;
+static void* mi_getHeight = nullptr;
+static void* mi_getPixels32 = nullptr;
 
-static void* texType   = nullptr; // System.Type для Texture2D
-static void* g_domain  = nullptr;
+static bool g_resolveDone = false;
+static volatile bool g_applyEnabled = false;
+static volatile bool g_dumpNow = false;
+static bool g_applyDisabledMsgShown = false;
+static std::set<std::string> g_appliedFiles;
 
-static bool g_pngStatic = false; // EncodeToPNG/LoadImage найдены статическими
+// ============================== api resolve ==============================
+static bool ResolveApi() {
+    void* h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) {
+        TxLogTs("dlopen libil2cpp.so failed");
+        return false;
+    }
+#define TX_SYM(var, name) do { (var) = (decltype(var))dlsym(h, name); } while (0)
+    TX_SYM(il2cpp_domain_get, "il2cpp_domain_get");
+    TX_SYM(il2cpp_domain_get_assemblies, "il2cpp_domain_get_assemblies");
+    TX_SYM(il2cpp_assembly_get_image, "il2cpp_assembly_get_image");
+    TX_SYM(il2cpp_image_get_name, "il2cpp_image_get_name");
+    TX_SYM(il2cpp_class_from_name, "il2cpp_class_from_name");
+    TX_SYM(il2cpp_class_get_method_from_name, "il2cpp_class_get_method_from_name");
+    TX_SYM(il2cpp_runtime_invoke, "il2cpp_runtime_invoke");
+    TX_SYM(il2cpp_thread_attach, "il2cpp_thread_attach");
+    TX_SYM(il2cpp_string_chars, "il2cpp_string_chars");
+    TX_SYM(il2cpp_array_length, "il2cpp_array_length");
+    TX_SYM(il2cpp_array_new, "il2cpp_array_new");
+    TX_SYM(il2cpp_class_get_type, "il2cpp_class_get_type");
+    TX_SYM(il2cpp_type_get_object, "il2cpp_type_get_object");
+#undef TX_SYM
 
-static std::string g_dumpDir;
-static std::string g_modDir;
-
-static const char* kStorageRoot = "/storage/emulated/0";
-// Ограничение на дамп через пиксели: не более 16 млн пикселей (4096x4096)
-static const uint64_t kMaxPixels = 16ull * 1024ull * 1024ull;
-
-// Смещения il2cpp (arm64)
-static constexpr uintptr_t kArrayHeaderSize = 0x20;   // klass, monitor, bounds, max_length
-static constexpr uintptr_t kBoxedValueOffset = 0x10;  // klass, monitor, value
-
-static inline void* ArrayData(void* arr) {
-    return (void*)((char*)arr + kArrayHeaderSize);
+    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies || !il2cpp_assembly_get_image ||
+        !il2cpp_class_from_name || !il2cpp_class_get_method_from_name || !il2cpp_runtime_invoke) {
+        TxLogTs("missing core il2cpp exports");
+        return false;
+    }
+    return true;
 }
 
-// ===================== Поток: аттач перед работой =====================
-// Аттач вынесен из ResolveIl2Cpp: на повторных запусках игры домен мог
-// вернуться до полной инициализации рантайма, и аттач ронял весь процесс.
-// Аттач идемпотентный — делаем его перед каждым блоком работы с il2cpp.
+// Аттач делаем только перед реальной работой с il2cpp — ранняя фаза убивала игру
 static bool EnsureThread() {
     if (!g_domain || !il2cpp_thread_attach) return false;
     il2cpp_thread_attach(g_domain);
     return true;
 }
 
-// ===================== Доступ к хранилищу =====================
-static bool StorageAccessOK() {
-    std::string p = std::string(kStorageRoot) + "/texdump_access_test";
-    FILE* t = fopen(p.c_str(), "wb");
-    if (!t) return false;
-    fclose(t);
-    remove(p.c_str());
-    return true;
+// ============================== invoke-хелперы ==============================
+static int32_t ArrLen(void* arr) {
+    if (!arr) return 0;
+    if (il2cpp_array_length) return (int32_t)il2cpp_array_length(arr);
+    return *(int32_t*)((uintptr_t)arr + 0x18);
 }
 
+static bool InvokeBool(void* method, void* obj) {
+    void* exc = nullptr;
+    void* r = il2cpp_runtime_invoke(method, obj, nullptr, &exc);
+    if (exc || !r) return false;
+    return *(uint8_t*)((uintptr_t)r + 0x10) != 0;
+}
+
+static int32_t InvokeInt(void* method, void* obj) {
+    void* exc = nullptr;
+    void* r = il2cpp_runtime_invoke(method, obj, nullptr, &exc);
+    if (exc || !r) return -1;
+    return *(int32_t*)((uintptr_t)r + 0x10);
+}
+
+static std::string InvokeString(void* method, void* obj) {
+    void* exc = nullptr;
+    void* r = il2cpp_runtime_invoke(method, obj, nullptr, &exc);
+    if (exc || !r || !il2cpp_string_chars) return "";
+    const char* c = il2cpp_string_chars(r);
+    return c ? std::string(c) : std::string();
+}
+
+static void* MakeByteArray(const uint8_t* data, size_t len) {
+    if (!byteKlass || !il2cpp_array_new || len == 0) return nullptr;
+    void* a = il2cpp_array_new(byteKlass, len);
+    if (!a) return nullptr;
+    memcpy((void*)((uintptr_t)a + 0x20), data, len);
+    return a;
+}
+
+static std::string SanitizeName(const std::string& in) {
+    std::string out;
+    for (size_t i = 0; i < in.size(); i++) {
+        unsigned char u = (unsigned char)in[i];
+        if (isalnum(u) || u == '_' || u == '-' || u == '.') out += (char)u;
+        else out += '_';
+    }
+    if (out.empty()) out = "tex";
+    if (out.size() > 100) out.resize(100);
+    return out;
+}
+
+// ============================== резолв классов ==============================
+static void ResolveIl2Cpp() {
+    if (g_resolveDone) return;
+    if (!EnsureThread()) {
+        TxLogTs("resolve: thread attach failed");
+        return;
+    }
+
+    size_t count = 0;
+    void** assemblies = nullptr;
+    for (int tries = 0; tries < 50; tries++) {
+        assemblies = il2cpp_domain_get_assemblies(g_domain, &count);
+        if (assemblies && count > 0) break;
+        usleep(200000);
+    }
+    if (!assemblies || count == 0) {
+        TxLogTs("no assemblies available");
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        void* image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        const char* nm = il2cpp_image_get_name ? il2cpp_image_get_name(image) : nullptr;
+        TxLog("asm[%d]: %s", (int)i, nm ? nm : "?");
+        if (!texKlass)    texKlass    = il2cpp_class_from_name(image, "UnityEngine", "Texture2D");
+        if (!imgConvKlass) imgConvKlass = il2cpp_class_from_name(image, "UnityEngine", "ImageConversion");
+        if (!objKlass)    objKlass    = il2cpp_class_from_name(image, "UnityEngine", "Object");
+        if (!byteKlass)   byteKlass   = il2cpp_class_from_name(image, "System", "Byte");
+    }
+
+    TxLogTs(imgConvKlass ? "ImageConversion found" : "ImageConversion NOT found (stripped?)");
+    if (!texKlass) {
+        TxLogTs("Texture2D NOT found");
+        return;
+    }
+
+    void* t = il2cpp_class_get_type(texKlass);
+    if (t) g_texType = il2cpp_type_get_object(t);
+
+    if (objKlass) mi_findAll = il2cpp_class_get_method_from_name(objKlass, "FindObjectsOfTypeAll", 1);
+
+    if (imgConvKlass) {
+        mi_encodePNG = il2cpp_class_get_method_from_name(imgConvKlass, "EncodeToPNG", 1);
+        mi_loadImage = il2cpp_class_get_method_from_name(imgConvKlass, "LoadImage", 2);
+        if (mi_encodePNG) mi_encodeStatic = true;
+        if (mi_loadImage) mi_loadStatic = true;
+    }
+    if (texKlass) {
+        if (!mi_encodePNG) mi_encodePNG = il2cpp_class_get_method_from_name(texKlass, "EncodeToPNG", 0);
+        if (!mi_loadImage) mi_loadImage = il2cpp_class_get_method_from_name(texKlass, "LoadImage", 1);
+        mi_apply       = il2cpp_class_get_method_from_name(texKlass, "Apply", 0);
+        mi_isReadable  = il2cpp_class_get_method_from_name(texKlass, "get_isReadable", 0);
+        mi_getName     = il2cpp_class_get_method_from_name(texKlass, "get_name", 0);
+        mi_getWidth    = il2cpp_class_get_method_from_name(texKlass, "get_width", 0);
+        mi_getHeight   = il2cpp_class_get_method_from_name(texKlass, "get_height", 0);
+        mi_getPixels32 = il2cpp_class_get_method_from_name(texKlass, "GetPixels32", 0);
+        mi_loadRaw     = il2cpp_class_get_method_from_name(texKlass, "LoadRawTextureData", 1);
+    }
+
+    TxLog("resolved: tex=%p imgConv=%p type=%p findAll=%p enc=%p(static=%d) load=%p(static=%d) raw=%p apply=%p pixels=%p",
+          texKlass, imgConvKlass, g_texType, mi_findAll,
+          mi_encodePNG, (int)mi_encodeStatic,
+          mi_loadImage, (int)mi_loadStatic,
+          mi_loadRaw, mi_apply, mi_getPixels32);
+
+    g_resolveDone = true;
+}
+
+// ============================== дамп ==============================
 static bool DumpExists() {
-    DIR* d = opendir(g_dumpDir.c_str());
+    DIR* d = opendir(DUMP_DIR);
     if (!d) return false;
-    bool has = false;
+    bool any = false;
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
-        // texmod_log.txt не считаем содержимым дампа
-        if (e->d_name[0] != '.' && strcmp(e->d_name, "texmod_log.txt") != 0) {
-            has = true;
+        size_t len = strlen(e->d_name);
+        if (len > 4 && strcmp(e->d_name + len - 4, ".png") == 0) { any = true; break; }
+    }
+    closedir(d);
+    return any;
+}
+
+static int DumpTextures() {
+    if (!EnsureThread()) return 0;
+    if (!g_texType || !mi_findAll || !texKlass) {
+        TxLogTs("dump: core methods not resolved");
+        return 0;
+    }
+
+    void* exc = nullptr;
+    void* params[1] = { g_texType };
+    void* arr = il2cpp_runtime_invoke(mi_findAll, nullptr, params, &exc);
+    if (exc || !arr) {
+        TxLogTs("FindObjectsOfTypeAll failed");
+        return 0;
+    }
+
+    int32_t n = ArrLen(arr);
+    TxLog("objects found: %d", (int)n);
+    if (n <= 0) return 0;
+
+    void** items = (void**)((uintptr_t)arr + 0x20);
+    mkdir(DUMP_DIR, 0777);
+
+    int saved = 0, skipped = 0, unreadable = 0;
+
+    for (int32_t i = 0; i < n; i++) {
+        void* tex = items[i];
+        if (!tex) { skipped++; continue; }
+        if (mi_isReadable && !InvokeBool(mi_isReadable, tex)) { unreadable++; continue; }
+
+        int w = mi_getWidth  ? (int)InvokeInt(mi_getWidth, tex)  : 0;
+        int h = mi_getHeight ? (int)InvokeInt(mi_getHeight, tex) : 0;
+        if (w <= 0 || h <= 0) { skipped++; continue; }
+
+        std::string name = mi_getName ? InvokeString(mi_getName, tex) : "";
+        std::string fname = SanitizeName(name);
+
+        char path[512];
+        bool exists = false;
+        for (int dup = 1; dup < 100; dup++) {
+            if (dup == 1) snprintf(path, sizeof(path), "%s/%s.png", DUMP_DIR, fname.c_str());
+            else snprintf(path, sizeof(path), "%s/%s_%d.png", DUMP_DIR, fname.c_str(), dup);
+            struct stat st;
+            if (stat(path, &st) != 0) { exists = false; break; }
+            exists = true;
+        }
+        if (exists) { skipped++; continue; }
+
+        if (mi_encodePNG) {
+            void* png = nullptr;
+            exc = nullptr;
+            if (mi_encodeStatic) {
+                void* p[1] = { tex };
+                png = il2cpp_runtime_invoke(mi_encodePNG, nullptr, p, &exc);
+            } else {
+                png = il2cpp_runtime_invoke(mi_encodePNG, tex, nullptr, &exc);
+            }
+            if (exc || !png) { skipped++; continue; }
+            int32_t len = ArrLen(png);
+            const uint8_t* data = (const uint8_t*)((uintptr_t)png + 0x20);
+            FILE* fp = fopen(path, "wb");
+            if (!fp) { skipped++; continue; }
+            fwrite(data, 1, (size_t)len, fp);
+            fclose(fp);
+            saved++;
+        } else if (mi_getPixels32) {
+            void* cols = nullptr;
+            exc = nullptr;
+            cols = il2cpp_runtime_invoke(mi_getPixels32, tex, nullptr, &exc);
+            if (exc || !cols) { unreadable++; continue; }
+            int32_t cn = ArrLen(cols);
+            if ((int32_t)w * (int32_t)h != cn) { skipped++; continue; }
+            if (w * h > 16 * 1024 * 1024) {
+                TxLog("skip too large: %s %dx%d", fname.c_str(), w, h);
+                skipped++;
+                continue;
+            }
+            const uint8_t* px = (const uint8_t*)((uintptr_t)cols + 0x20);
+            FILE* fp = fopen(path, "wb");
+            if (!fp) { skipped++; continue; }
+            if (!WritePngStored(fp, w, h, px)) {
+                fclose(fp);
+                remove(path);
+                skipped++;
+            } else {
+                fclose(fp);
+                saved++;
+            }
+        } else {
+            skipped++;
+        }
+    }
+
+    TxLog("dump done: saved=%d skipped=%d unreadable=%d", saved, skipped, unreadable);
+    return saved;
+}
+
+// ============================== применение ==============================
+static void ApplyCustomTextures() {
+    if (!EnsureThread()) return;
+    if (!texKlass || !mi_apply || !g_texType || !mi_findAll) return;
+
+    if (!mi_loadImage && !mi_loadRaw) {
+        if (!g_applyDisabledMsgShown) {
+            g_applyDisabledMsgShown = true;
+            TxLogTs("apply disabled: LoadImage/LoadRawTextureData not available");
+        }
+        return;
+    }
+
+    void* exc = nullptr;
+    void* params[1] = { g_texType };
+    void* arr = il2cpp_runtime_invoke(mi_findAll, nullptr, params, &exc);
+    if (exc || !arr) return;
+    int32_t n = ArrLen(arr);
+    if (n <= 0) return;
+    void** items = (void**)((uintptr_t)arr + 0x20);
+
+    DIR* d = opendir(APPLY_DIR);
+    if (!d) return;
+
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        std::string fn(e->d_name);
+        bool isPng = fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".png") == 0;
+        bool isRaw = fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".raw") == 0;
+        if (!isPng && !isRaw) continue;
+
+        bool usePng = isPng && mi_loadImage;
+        bool useRaw = isRaw && mi_loadRaw;
+        if (!usePng && !useRaw) continue;
+
+        std::string base = fn.substr(0, fn.size() - 4);
+
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "%s/%s", APPLY_DIR, fn.c_str());
+        FILE* f = fopen(fpath, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { fclose(f); continue; }
+        std::vector<uint8_t> bytes((size_t)sz);
+        fread(bytes.data(), 1, bytes.size(), f);
+        fclose(f);
+
+        for (int32_t i = 0; i < n; i++) {
+            void* tex = items[i];
+            if (!tex) continue;
+            std::string tname = mi_getName ? InvokeString(mi_getName, tex) : "";
+            if (tname != base) continue;
+            if (g_appliedFiles.count(base)) break;
+
+            void* exc2 = nullptr;
+            if (usePng) {
+                void* bArr = MakeByteArray(bytes.data(), bytes.size());
+                if (!bArr) break;
+                if (mi_loadStatic) {
+                    void* p[2] = { tex, bArr };
+                    il2cpp_runtime_invoke(mi_loadImage, nullptr, p, &exc2);
+                } else {
+                    void* p[1] = { bArr };
+                    il2cpp_runtime_invoke(mi_loadImage, tex, p, &exc2);
+                }
+            } else {
+                int w = (int)InvokeInt(mi_getWidth, tex);
+                int h = (int)InvokeInt(mi_getHeight, tex);
+                if (w <= 0 || h <= 0) break;
+                if ((size_t)sz != (size_t)w * (size_t)h * 4) break;
+                void* bArr = MakeByteArray(bytes.data(), bytes.size());
+                if (!bArr) break;
+                void* p[1] = { bArr };
+                il2cpp_runtime_invoke(mi_loadRaw, tex, p, &exc2);
+            }
+
+            if (!exc2) {
+                il2cpp_runtime_invoke(mi_apply, tex, nullptr, &exc2);
+                if (!exc2) {
+                    g_appliedFiles.insert(base);
+                    TxLog("applied: %s", base.c_str());
+                }
+            }
             break;
         }
     }
     closedir(d);
-    return has;
 }
 
-// ===================== PNG-кодировщик (без zlib: stored-блоки) =====================
-static uint32_t Crc32(const uint8_t* data, size_t len) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
+static void DumpLoop() {
+    for (int attempt = 1; attempt <= 12; attempt++) {
+        if (DumpExists()) {
+            TxLogTs("dump exists, skip");
+            return;
         }
-        init = true;
+        TxLog("dump attempt %d/12", attempt);
+        int saved = DumpTextures();
+        if (saved > 0) return;
+        if (attempt < 12) sleep(30);
     }
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i)
-        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    TxLogTs("dump gave up after 12 attempts");
 }
 
-static uint32_t Adler32(const uint8_t* data, size_t len) {
-    uint32_t a = 1, b = 0;
-    for (size_t i = 0; i < len; ++i) {
-        a = (a + data[i]) % 65521;
-        b = (b + a) % 65521;
-    }
-    return (b << 16) | a;
+// ============================== контракт с меню ==============================
+// Сигнатуры должны совпадать с декларациями в Menu.hpp.
+// Если при сборке появится "multiple definition" — значит, эти функции
+// уже определены в Menu.cpp, тогда удали их оттуда (или скажи мне).
+extern "C" jobjectArray GetFeatureList(JNIEnv *env, jclass clazz) {
+    const char* features[2];
+    features[0] = OBFUSCATE("Toggle_Apply custom textures");
+    features[1] = OBFUSCATE("Button_Dump textures now");
+    int count = 2;
+
+    jclass strClass = env->FindClass(OBFUSCATE("java/lang/String"));
+    jobjectArray ret = (jobjectArray)env->NewObjectArray(count, strClass, env->NewStringUTF(OBFUSCATE("")));
+    for (int i = 0; i < count; i++)
+        env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
+    return ret;
 }
 
-static void Put32(std::vector<uint8_t>& v, uint32_t x) {
-    v.push_back((uint8_t)(x >> 24));
-    v.push_back((uint8_t)(x >> 16));
-    v.push_back((uint8_t)(x >> 8));
-    v.push_back((uint8_t)(x & 0xFF));
+extern "C" void* Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jboolean boolean, jstring toastErrorMsg) {
+    switch (featNum) {
+        case 0:
+            g_applyEnabled = (bool)boolean;
+            TxLog("apply toggled: %s", g_applyEnabled ? "ON" : "OFF");
+            break;
+        case 1:
+            g_dumpNow = true;
+            break;
+        default:
+            break;
+    }
+    return nullptr;
 }
 
-static void Chunk(std::vector<uint8_t>& png, const char* type, const std::vector<uint8_t>& payload) {
-    Put32(png, (uint32_t)payload.size());
-    for (int i = 0; i < 4; ++i) png.push_back((uint8_t)type[i]);
-    if (!payload.empty()) {
-        png.insert(png.end(), payload.begin(), payload.end());
-        size_t crcStart = png.size() - payload.size() - 4;
-        uint32_t crc = Crc32(&png[crcStart], payload.size() + 4);
-        Put32(png, crc);
-    } else {
-        uint32_t crc = Crc32(&png[png.size() - 4], 4);
-        Put32(png, crc);
-    }
-}
-
-// RGBA32 -> PNG (zlib stored-блоки, без сжатия — файл больше, но читается везде)
-static bool WritePngRGBA(const std::string& path, uint32_t w, uint32_t h, const uint8_t* px) {
-    std::vector<uint8_t> raw;
-    raw.reserve((size_t)h * (1 + (size_t)w * 4));
-    for (uint32_t y = 0; y < h; ++y) {
-        raw.push_back(0); // filter: none
-        const uint8_t* line = px + (size_t)y * w * 4;
-        raw.insert(raw.end(), line, line + (size_t)w * 4);
-    }
-
-    std::vector<uint8_t> z;
-    z.push_back(0x78);
-    z.push_back(0x01);
-    size_t off = 0;
-    while (off < raw.size()) {
-        size_t n = raw.size() - off;
-        if (n > 65535) n = 65535;
-        bool last = (off + n == raw.size());
-        z.push_back(last ? 1 : 0);
-        z.push_back((uint8_t)(n & 0xFF));
-        z.push_back((uint8_t)((n >> 8) & 0xFF));
-        z.push_back((uint8_t)((~n) & 0xFF));
-        z.push_back((uint8_t)(((~n) >> 8) & 0xFF));
-        z.insert(z.end(), raw.begin() + off, raw.begin() + off + n);
-        off += n;
-    }
-    Put32(z, Adler32(raw.data(), raw.size()));
-
-    std::vector<uint8_t> png;
-    const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-    png.insert(png.end(), sig, sig + 8);
-
-    std::vector<uint8_t> ihdr;
-    Put32(ihdr, w);
-    Put32(ihdr, h);
-    ihdr.push_back(8); // bit depth
-    ihdr.push_back(6); // color type: RGBA
-    ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
-    Chunk(png, "IHDR", ihdr);
-    Chunk(png, "IDAT", z);
-    Chunk(png, "IEND", std::vector<uint8_t>());
-
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    size_t wr = fwrite(png.data(), 1, png.size(), f);
-    fclose(f);
-    return wr == png.size();
-}
-
-// ===================== Утилиты =====================
-static std::string SanitizeName(const char* name) {
-    std::string out;
-    for (const char* p = name; *p; ++p) {
-        unsigned char c = (unsigned char)*p;
-        if (isalnum(c) || c == '_' || c == '-') out += (char)c;
-        else out += '_';
-    }
-    if (out.empty()) out = "unnamed";
-    return out;
-}
-
-static bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return false; }
-    out.resize((size_t)sz);
-    size_t r = fread(out.data(), 1, (size_t)sz, f);
-    fclose(f);
-    return r == (size_t)sz;
-}
-
-// ===================== Резолв il2cpp =====================
-static void ResolveIl2Cpp() {
-    void* h = nullptr;
-    while (!h) {
-        h = dlopen(OBFUSCATE("libil2cpp.so"), RTLD_NOW | RTLD_GLOBAL);
-        if (!h) {
-            LogMsg("waiting for libil2cpp.so...");
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
-    }
-    LogMsg("libil2cpp.so loaded");
-
-    il2cpp_domain_get              = (il2cpp_domain_get_t)             dlsym(h, OBFUSCATE("il2cpp_domain_get"));
-    il2cpp_domain_get_assemblies   = (il2cpp_domain_get_assemblies_t)  dlsym(h, OBFUSCATE("il2cpp_domain_get_assemblies"));
-    il2cpp_assembly_get_image      = (il2cpp_assembly_get_image_t)     dlsym(h, OBFUSCATE("il2cpp_assembly_get_image"));
-    il2cpp_class_from_name         = (il2cpp_class_from_name_t)        dlsym(h, OBFUSCATE("il2cpp_class_from_name"));
-    il2cpp_class_get_method_from_name = (il2cpp_class_get_method_from_name_t) dlsym(h, OBFUSCATE("il2cpp_class_get_method_from_name"));
-    il2cpp_runtime_invoke          = (il2cpp_runtime_invoke_t)         dlsym(h, OBFUSCATE("il2cpp_runtime_invoke"));
-    il2cpp_thread_attach           = (il2cpp_thread_attach_t)          dlsym(h, OBFUSCATE("il2cpp_thread_attach"));
-    il2cpp_string_chars            = (il2cpp_string_chars_t)           dlsym(h, OBFUSCATE("il2cpp_string_chars"));
-    il2cpp_array_length            = (il2cpp_array_length_t)           dlsym(h, OBFUSCATE("il2cpp_array_length"));
-    il2cpp_array_new               = (il2cpp_array_new_t)              dlsym(h, OBFUSCATE("il2cpp_array_new"));
-    il2cpp_class_get_type          = (il2cpp_class_get_type_t)         dlsym(h, OBFUSCATE("il2cpp_class_get_type"));
-    il2cpp_type_get_object         = (il2cpp_type_get_object_t)        dlsym(h, OBFUSCATE("il2cpp_type_get_object"));
-    il2cpp_value_box               = (il2cpp_value_box_t)              dlsym(h, OBFUSCATE("il2cpp_value_box"));
-
-    if (!il2cpp_domain_get || !il2cpp_runtime_invoke || !il2cpp_domain_get_assemblies) {
-        LogMsg("core il2cpp symbols missing, thread exit");
-        return;
-    }
-
-    // Ждём домен. БЕЗ аттача здесь — только чтение указателя.
-    while (!g_domain) {
-        g_domain = il2cpp_domain_get();
-        if (!g_domain) {
-            LogMsg("waiting for il2cpp domain...");
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
-    }
-    LogMsg("il2cpp domain ready");
-
-    // Ждём непустой список сборок — рантайм ещё может быть не готов
-    size_t count = 0;
-    void** assemblies = nullptr;
-    for (int tries = 0; tries < 30; ++tries) {
-        assemblies = il2cpp_domain_get_assemblies(g_domain, &count);
-        if (assemblies && count > 0) break;
-        LogMsg("waiting for assemblies...");
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-    if (!assemblies || count == 0) {
-        LogMsg("assemblies never appeared, thread exit");
-        return;
-    }
-
-    // Обход сборок: логируем имена (Il2CppImage::name — первое поле образа),
-    // резолвим классы
-    for (size_t i = 0; i < count; ++i) {
-        void* image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        const char* imgName = *(const char**)image;
-        LogMsg("asm[%zu]: %s", i, imgName ? imgName : "?");
-
-        if (!texKlass)     texKlass     = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("Texture2D"));
-        if (!resKlass)     resKlass     = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("Resources"));
-        if (!byteKlass)    byteKlass    = il2cpp_class_from_name(image, OBFUSCATE("System"), OBFUSCATE("Byte"));
-        if (!boolKlass)    boolKlass    = il2cpp_class_from_name(image, OBFUSCATE("System"), OBFUSCATE("Boolean"));
-        if (!objKlass)     objKlass     = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("Object"));
-        if (!imgConvKlass) imgConvKlass = il2cpp_class_from_name(image, OBFUSCATE("UnityEngine"), OBFUSCATE("ImageConversion"));
-    }
-
-    if (resKlass) mi_findAll = il2cpp_class_get_method_from_name(resKlass, OBFUSCATE("FindObjectsOfTypeAll"), 1);
-    if (objKlass) mi_objGetName = il2cpp_class_get_method_from_name(objKlass, OBFUSCATE("get_name"), 0);
-    if (texKlass) {
-        mi_apply       = il2cpp_class_get_method_from_name(texKlass, OBFUSCATE("Apply"), 2);
-        mi_isReadable  = il2cpp_class_get_method_from_name(texKlass, OBFUSCATE("get_isReadable"), 0);
-        mi_getWidth    = il2cpp_class_get_method_from_name(texKlass, OBFUSCATE("get_width"), 0);
-        mi_getHeight   = il2cpp_class_get_method_from_name(texKlass, OBFUSCATE("get_height"), 0);
-        mi_getPixels32 = il2cpp_class_get_method_from_name(texKlass, OBFUSCATE("GetPixels32"), 0);
-        if (il2cpp_class_get_type && il2cpp_type_get_object)
-            texType = il2cpp_type_get_object(il2cpp_class_get_type(texKlass));
-    }
-    if (imgConvKlass) {
-        mi_encodePNG = il2cpp_class_get_method_from_name(imgConvKlass, OBFUSCATE("EncodeToPNG"), 1);
-        mi_loadImage = il2cpp_class_get_method_from_name(imgConvKlass, OBFUSCATE("LoadImage"), 2);
-        g_pngStatic = (mi_encodePNG != nullptr);
-    }
-    // Если ImageConversion не нашёлся — остаёмся без PNG-методов:
-    // дамп пойдёт через GetPixels32 + собственный PNG-кодировщик,
-    // применение PNG будет отключено до выяснения.
-
-    LogMsg("il2cpp resolved: tex=%p imgConv=%p type=%p findAll=%p enc=%p load=%p apply=%p px32=%p",
-           texKlass, imgConvKlass, texType, mi_findAll,
-           mi_encodePNG, mi_loadImage, mi_apply, mi_getPixels32);
-    if (!imgConvKlass)
-        LogMsg("ImageConversion NOT found in %zu assemblies — pixel fallback active", count);
-    if (!texType)
-        LogMsg("texType missing — FindObjectsOfTypeAll unusable");
-}
-
-// ===================== Дамп =====================
-static void DumpTextures() {
-    if (!EnsureThread()) { LogMsg("dump: thread attach failed"); return; }
-    if (!mi_findAll || !texType || !mi_objGetName) {
-        LogMsg("dump skipped: missing core methods");
-        return;
-    }
-
-    void* params[1] = { texType };
-    void* exc = nullptr;
-    void* arr = il2cpp_runtime_invoke(mi_findAll, nullptr, params, &exc);
-    if (exc || !arr) {
-        LogMsg("FindObjectsOfTypeAll failed");
-        return;
-    }
-
-    uint32_t count = il2cpp_array_length(arr);
-    LogMsg("objects found: %u", count);
-
-    void** data = (void**)ArrayData(arr);
-    int saved = 0, skipped = 0, unreadable = 0;
-
-    for (uint32_t i = 0; i < count; ++i) {
-        void* tex = data[i];
-        if (!tex) { skipped++; continue; }
-
-        exc = nullptr;
-        void* nameObj = il2cpp_runtime_invoke(mi_objGetName, tex, nullptr, &exc);
-        if (exc || !nameObj) { skipped++; continue; }
-        const char* cname = il2cpp_string_chars(nameObj);
-        if (!cname || !*cname) { skipped++; continue; }
-
-        if (mi_isReadable) {
-            exc = nullptr;
-            void* r = il2cpp_runtime_invoke(mi_isReadable, tex, nullptr, &exc);
-            if (!exc && r && *(bool*)((char*)r + kBoxedValueOffset) == false) {
-                unreadable++;
-                continue;
-            }
-        }
-
-        std::string fname = SanitizeName(cname) + ".png";
-        std::string path = g_dumpDir + "/" + fname;
-        bool ok = false;
-
-        if (mi_encodePNG) {
-            // Unity 5.6+: статический EncodeToPNG(tex) в ImageConversion
-            void* encParams[1] = { tex };
-            exc = nullptr;
-            void* png = g_pngStatic
-                ? il2cpp_runtime_invoke(mi_encodePNG, nullptr, encParams, &exc)
-                : il2cpp_runtime_invoke(mi_encodePNG, tex, nullptr, &exc);
-            if (!exc && png) {
-                uint32_t pngSize = il2cpp_array_length(png);
-                if (pngSize > 0) {
-                    FILE* f = fopen(path.c_str(), "wb");
-                    if (f) {
-                        size_t w = fwrite(ArrayData(png), 1, pngSize, f);
-                        fclose(f);
-                        ok = (w == pngSize);
-                    }
-                }
-            }
-        } else if (mi_getPixels32 && mi_getWidth && mi_getHeight) {
-            // Фолбэк: пиксели + собственный PNG-кодировщик
-            exc = nullptr;
-            void* wObj = il2cpp_runtime_invoke(mi_getWidth, tex, nullptr, &exc);
-            if (exc || !wObj) { skipped++; continue; }
-            exc = nullptr;
-            void* hObj = il2cpp_runtime_invoke(mi_getHeight, tex, nullptr, &exc);
-            if (exc || !hObj) { skipped++; continue; }
-            uint32_t w = (uint32_t)*(int32_t*)((char*)wObj + kBoxedValueOffset);
-            uint32_t h = (uint32_t)*(int32_t*)((char*)hObj + kBoxedValueOffset);
-            if (w == 0 || h == 0) { skipped++; continue; }
-            if ((uint64_t)w * h > kMaxPixels) {
-                LogMsg("skip too large: %s (%ux%u)", cname, w, h);
-                skipped++;
-                continue;
-            }
-
-            exc = nullptr;
-            void* pixArr = il2cpp_runtime_invoke(mi_getPixels32, tex, nullptr, &exc);
-            if (exc || !pixArr) { skipped++; continue; }
-            uint32_t n = il2cpp_array_length(pixArr);
-            if (n != w * h) { skipped++; continue; }
-
-            ok = WritePngRGBA(path, w, h, (const uint8_t*)ArrayData(pixArr));
-        }
-
-        if (ok) saved++;
-        else skipped++;
-    }
-
-    LogMsg("dump done: saved=%d skipped=%d unreadable=%d", saved, skipped, unreadable);
-}
-
-// ===================== Применение текстур =====================
-static void ApplyCustomTextures() {
-    if (!EnsureThread()) return;
-    if (!mi_findAll || !texType || !mi_objGetName || !mi_apply || !boolKlass) return;
-    if (!mi_loadImage || !byteKlass || !il2cpp_value_box || !il2cpp_array_new) {
-        // LoadImage недоступен (ImageConversion не найден) — применение PNG пока нельзя
-        static bool warned = false;
-        if (!warned) {
-            LogMsg("apply disabled: LoadImage unavailable (ImageConversion missing)");
-            warned = true;
-        }
-        return;
-    }
-
-    void* params[1] = { texType };
-    void* exc = nullptr;
-    void* arr = il2cpp_runtime_invoke(mi_findAll, nullptr, params, &exc);
-    if (exc || !arr) return;
-    uint32_t count = il2cpp_array_length(arr);
-    void** data = (void**)ArrayData(arr);
-
-    DIR* d = opendir(g_modDir.c_str());
-    if (!d) return;
-
-    int applied = 0;
-    struct dirent* e;
-    while ((e = readdir(d)) != nullptr) {
-        std::string fname = e->d_name;
-        if (fname.size() < 5) continue;
-        if (fname.compare(fname.size() - 4, 4, ".png") != 0) continue;
-        std::string want = fname.substr(0, fname.size() - 4);
-
-        void* target = nullptr;
-        for (uint32_t i = 0; i < count; ++i) {
-            void* tex = data[i];
-            if (!tex) continue;
-            exc = nullptr;
-            void* nameObj = il2cpp_runtime_invoke(mi_objGetName, tex, nullptr, &exc);
-            if (exc || !nameObj) continue;
-            const char* cname = il2cpp_string_chars(nameObj);
-            if (cname && want == SanitizeName(cname)) { target = tex; break; }
-        }
-        if (!target) continue;
-
-        std::vector<uint8_t> png;
-        if (!ReadFileBytes(g_modDir + "/" + fname, png)) continue;
-
-        void* byteArr = il2cpp_array_new(byteKlass, (uintptr_t)png.size());
-        if (!byteArr) continue;
-        memcpy(ArrayData(byteArr), png.data(), png.size());
-
-        // Unity 5.6+: статический LoadImage(tex, byte[])
-        void* liParams[2] = { target, byteArr };
-        exc = nullptr;
-        if (g_pngStatic)
-            il2cpp_runtime_invoke(mi_loadImage, nullptr, liParams, &exc);
-        else
-            il2cpp_runtime_invoke(mi_loadImage, target, (void**)&byteArr, &exc);
-        if (exc) continue;
-
-        bool a = true, b = false;
-        void* applyParams[2] = {
-            il2cpp_value_box(boolKlass, &a),
-            il2cpp_value_box(boolKlass, &b)
-        };
-        exc = nullptr;
-        il2cpp_runtime_invoke(mi_apply, target, applyParams, &exc);
-        if (exc) continue;
-
-        applied++;
-    }
-    closedir(d);
-
-    if (applied > 0) LogMsg("apply done: %d", applied);
-}
-
-// ===================== Главный поток =====================
-static void hack_thread() {
-    // libil2cpp.so загружается не сразу — ждём
+// ============================== главный поток ==============================
+static void HackThread() {
     while (!isLibraryLoaded(targetLibName)) {
         sleep(1);
     }
+    TxLogTs("libil2cpp.so loaded");
+
+    if (!ResolveApi()) return;
+
+    for (;;) {
+        void* d = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
+        if (d) { g_domain = d; break; }
+        sleep(1);
+    }
+    TxLogTs("il2cpp domain ready");
 
     ResolveIl2Cpp();
 
-    if (!texKlass || !il2cpp_runtime_invoke) {
-        LogMsg("il2cpp not available, thread exit");
-        return;
-    }
+    std::thread(DumpLoop).detach();
 
-    g_dumpDir = std::string(kStorageRoot) + "/texdump";
-    g_modDir  = std::string(kStorageRoot) + "/texmod";
-
-    // Ждём выдачи MANAGE_EXTERNAL_STORAGE — тумблер могут включить после старта
-    while (!StorageAccessOK()) {
-        LogMsg("storage access DENIED — enable All files access (retry 10s)");
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-    }
-    LogMsg("storage access OK");
-    OpenLogFile(); // сбрасываем накопленные до этого строки в файл
-
-    mkdir(g_dumpDir.c_str(), 0777);
-    mkdir(g_modDir.c_str(), 0777);
-
-    // Дамп с повторами: текстуры появляются после загрузки сцен
-    if (!DumpExists()) {
-        bool dumped = false;
-        for (int attempt = 1; attempt <= 12 && !dumped; ++attempt) {
-            LogMsg("dump attempt %d/12", attempt);
-            DumpTextures();
-            dumped = DumpExists();
-            if (!dumped)
-                std::this_thread::sleep_for(std::chrono::seconds(30));
-        }
-    } else {
-        LogMsg("dump exists, skip");
-    }
-
-    // Цикл применения: подхватываем PNG из /texmod раз в минуту
     while (true) {
-        ApplyCustomTextures();
-        std::this_thread::sleep_for(std::chrono::seconds(60));
+        if (g_dumpNow) {
+            g_dumpNow = false;
+            DumpTextures();
+        }
+        if (g_applyEnabled) ApplyCustomTextures();
+        sleep(2);
     }
 }
 
-// ============================================================================
-// Контракт LGL: определения совпадают с Menu.hpp один-в-один.
-// Setup.cpp регистрирует их через RegisterNatives.
-// ============================================================================
-
-jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
-    (void)context;
-    jclass strClass = env->FindClass(OBFUSCATE("java/lang/String"));
-    if (!strClass) return nullptr;
-    return env->NewObjectArray(0, strClass, nullptr);
+__attribute__((constructor)) static void lib_main() {
+    std::thread(HackThread).detach();
 }
-
-void Changes(JNIEnv *env, jclass clazz, jobject obj,
-             jint featNum, jstring featName, jint value, jlong Lvalue,
-             jboolean boolean, jstring str) {
-    (void)env; (void)clazz; (void)obj; (void)featNum;
-    (void)featName; (void)value; (void)Lvalue; (void)boolean; (void)str;
-}
-
-// ============================================================================
-// Точка входа — конструктор библиотеки: запускается автоматически при
-// загрузке .so в процесс игры. JNI_OnLoad находится в Setup.cpp.
-// ============================================================================
-
-__attribute__((constructor))
-static void lib_main() {
-    std::thread(hack_thread).detach();
-}
-
