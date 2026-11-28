@@ -496,34 +496,39 @@ void lib_main() {
 }
 
 // ================= menu contract =================
-// Signatures must match Menu.hpp exactly:
-//   jobjectArray GetFeatureList(JNIEnv *env, jobject context);
-//   void Changes(JNIEnv *env, jclass clazz, jobject obj,
-//                jint featNum, jstring featName, jint value, jlong Lvalue,
-//                jboolean boolean, jstring str);
+// Signatures copy Menu.hpp exactly (no extern "C"): Setup.cpp calls these
+// functions by their C++-mangled symbols.
+
+static void ClearPending(JNIEnv *env) {
+    if (env && env->ExceptionCheck()) env->ExceptionClear();
+}
 
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     (void)context;
+    ClearPending(env);
     const char *features[] = {
             OBFUSCATE("Category_Textures"),
             OBFUSCATE("0_Toggle_Inject Textures"),
     };
-    int Total_Feature = (int)(sizeof features / sizeof features[0]);
-    jobjectArray ret = (jobjectArray)
-            env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")),
-                                env->NewStringUTF(""));
-    for (int i = 0; i < Total_Feature; i++)
+    int total = (int)(sizeof features / sizeof features[0]);
+    jstring sample = env->NewStringUTF("");
+    jobjectArray ret = env->NewObjectArray(total, env->GetObjectClass(sample), sample);
+    for (int i = 0; i < total; i++)
         env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
+    ClearPending(env);
+    LOGI("GetFeatureList: %d features", total);
     return ret;
 }
 
 void Changes(JNIEnv *env, jclass clazz, jobject obj,
              jint featNum, jstring featName, jint value, jlong Lvalue,
              jboolean boolean, jstring str) {
-    (void)env; (void)clazz; (void)obj; (void)featName; (void)value; (void)Lvalue; (void)str;
+    (void)clazz; (void)obj; (void)featName; (void)value; (void)Lvalue; (void)str;
+    ClearPending(env);
     if (featNum == 0) {
         g_injectEnabled = (boolean != 0);
         LogMsg("inject enabled: %d", g_injectEnabled ? 1 : 0);
     }
     LOGI("Changes: featNum=%d boolean=%d", (int)featNum, (int)boolean);
+    ClearPending(env);
 }
