@@ -1,607 +1,614 @@
-// Main.cpp — TexMod: inject-only build
-// Fix #29: убран наш JNI_OnLoad (уже определён в Setup.cpp) — JavaVM берём
-// через официальный API JNI_GetCreatedJavaVMs, конфликтов линковки нет.
-
-#include "Menu/Menu.hpp"
-#include "Includes/obfuscate.h"
+// Main.cpp — real-time texture injector for Unity IL2CPP game
+// Contract (Menu.hpp): jobjectArray GetFeatureList(JNIEnv*, jobject);
+//                      void Changes(JNIEnv*, jclass, jobject, jint, jstring, jint, jlong, jboolean, jstring);
+// NOTE: no JNI_OnLoad here — it already exists in Menu/Setup.cpp (duplicate-symbol fix).
 
 #include <jni.h>
 #include <android/log.h>
+
 #include <dlfcn.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <time.h>
 #include <pthread.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <sys/stat.h>
 #include <dirent.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include <string>
 #include <vector>
+#include <set>
 
-// ==================== логирование ====================
-static void LogMsg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void LogMsg(const char* fmt, ...) {
-    char line[1024];
+#include "Includes/obfuscate.h"
+#include "Menu/Menu.hpp"
+
+#define TAG "TexMod"
+static const char* kLogPath = "/storage/emulated/0/texmod_log.txt";
+static const char* kTexDir  = "/storage/emulated/0/texmod";
+
+// ============================== logging ==============================
+
+static FILE* g_logFile = NULL;
+static pthread_mutex_t g_logMx = PTHREAD_MUTEX_INITIALIZER;
+
+static void LogF(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    time_t t = time(NULL);
-    struct tm tmv;
-    localtime_r(&t, &tmv);
-    char stamp[16];
-    strftime(stamp, sizeof(stamp), "%H:%M:%S", &tmv);
-    __android_log_print(ANDROID_LOG_INFO, "TexMod", "%s %s", stamp, line);
-    FILE* f = fopen("/storage/emulated/0/texmod_log.txt", "a");
-    if (f) { fprintf(f, "%s %s\n", stamp, line); fclose(f); }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "%s", buf);
+    pthread_mutex_lock(&g_logMx);
+    if (!g_logFile) g_logFile = fopen(kLogPath, "a");
+    if (g_logFile) { fprintf(g_logFile, "%s\n", buf); fflush(g_logFile); }
+    pthread_mutex_unlock(&g_logMx);
 }
 
-static void ClearPending(JNIEnv* env) {
-    if (env && env->ExceptionCheck()) env->ExceptionClear();
-}
+// ============================== il2cpp glue ==============================
 
-// ==================== доступ к JavaVM (без JNI_OnLoad!) ====================
-// Setup.cpp шаблона сам определяет JNI_OnLoad и регистрирует нативные методы,
-// поэтому здесь JVM получаем через JNI_GetCreatedJavaVMs.
-static JNIEnv* GetEnv() {
-    typedef jint (*fn_GetVMs)(JavaVM**, jsize, jsize*);
-    static fn_GetVMs getVMs = NULL;
-    if (!getVMs) getVMs = reinterpret_cast<fn_GetVMs>(dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
-    if (!getVMs) return NULL;
-    JavaVM* vms[4];
-    jsize n = 0;
-    if (getVMs(vms, 4, &n) != JNI_OK || n < 1 || !vms[0]) return NULL;
-    JNIEnv* env = NULL;
-    if (vms[0]->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK && env) return env;
-    if (vms[0]->AttachCurrentThread(&env, NULL) == JNI_OK) return env;
-    return NULL;
-}
+static void* g_il2cppHandle = NULL;
 
-// ==================== il2cpp API ====================
-typedef void* (*fn_DomainGet)();
-typedef void** (*fn_DomainGetAssemblies)(void*, unsigned long long*);
-typedef void* (*fn_ThreadAttach)(void*);
-typedef void* (*fn_AssemblyGetImage)(void*);
-typedef const char* (*fn_ImageGetName)(void*);
-typedef int (*fn_ImageGetClassCount)(void*);
-typedef void* (*fn_ImageGetClass)(void*, int);
-typedef const char* (*fn_ClassGetName)(void*);
-typedef const char* (*fn_ClassGetNamespace)(void*);
-typedef void* (*fn_ClassGetMethod)(void*, const char*, int);
-typedef void* (*fn_ClassGetFieldFromName)(void*, const char*);
-typedef void (*fn_FieldGetValue)(void*, void*, void*);
-typedef void* (*fn_ArrayNew)(void*, unsigned long long, void*);
-typedef void* (*fn_StringNew)(const char*);
-typedef unsigned short* (*fn_StringChars)(void*, unsigned long long*);
-typedef void* (*fn_RuntimeInvoke)(void*, void*, void**, void*);
-typedef void* (*fn_ResolveIcall)(const char*);
-typedef bool (*fn_LoadImageIcall)(void*, void*, bool);
+typedef struct Il2CppDomain_    Il2CppDomain;
+typedef struct Il2CppAssembly_  Il2CppAssembly;
+typedef struct Il2CppImage_     Il2CppImage;
+typedef struct Il2CppObject_    Il2CppObject;
 
-static void* g_handle = NULL;
-static void* g_domain = NULL;
-static fn_DomainGet p_DomainGet = NULL;
+typedef Il2CppDomain*   (*fn_DomainGet)();
+typedef Il2CppAssembly**(*fn_DomainGetAssemblies)(Il2CppDomain*, size_t*);
+typedef Il2CppImage*    (*fn_AsmGetImage)(Il2CppAssembly*);
+typedef const char*     (*fn_ImageGetName)(Il2CppImage*);
+typedef size_t          (*fn_ImageGetClassCount)(Il2CppImage*);
+typedef void*           (*fn_ImageGetClass)(Il2CppImage*, size_t);
+typedef const char*     (*fn_ClassGetName)(void*);
+typedef const char*     (*fn_ClassGetNamespace)(void*);
+typedef void*           (*fn_ClassGetMethod)(void*, const char*, int);
+typedef void*           (*fn_ClassGetField)(void*, const char*);
+typedef void*           (*fn_ClassGetType)(void*);
+typedef void*           (*fn_TypeGetObject)(void*);
+typedef void*           (*fn_ThreadAttach)(Il2CppDomain*);
+typedef void*           (*fn_ThreadCurrent)();
+typedef void*           (*fn_RuntimeInvoke)(void*, void*, void**, void**);
+typedef void            (*fn_FieldGetValue)(void*, void*, void*);
+typedef void*           (*fn_ArrayNew)(void*, unsigned long, void*);
+
+static fn_DomainGet           p_DomainGet = NULL;
 static fn_DomainGetAssemblies p_DomainGetAssemblies = NULL;
-static fn_ThreadAttach p_ThreadAttach = NULL;
-static fn_AssemblyGetImage p_AssemblyGetImage = NULL;
-static fn_ImageGetName p_ImageGetName = NULL;
-static fn_ImageGetClassCount p_ImageGetClassCount = NULL;
-static fn_ImageGetClass p_ImageGetClass = NULL;
-static fn_ClassGetName p_ClassGetName = NULL;
-static fn_ClassGetNamespace p_ClassGetNamespace = NULL;
-static fn_ClassGetMethod p_ClassGetMethod = NULL;
-static fn_ClassGetFieldFromName p_ClassGetFieldFromName = NULL;
-static fn_FieldGetValue p_FieldGetValue = NULL;
-static fn_ArrayNew p_ArrayNew = NULL;
-static fn_StringNew p_StringNew = NULL;
-static fn_StringChars p_StringChars = NULL;
-static fn_RuntimeInvoke p_RuntimeInvoke = NULL;
-static fn_ResolveIcall p_ResolveIcall = NULL;
-static fn_LoadImageIcall g_loadIcall = NULL;
+static fn_AsmGetImage         p_AsmGetImage = NULL;
+static fn_ImageGetName        p_ImageGetName = NULL;
+static fn_ImageGetClassCount  p_ImageGetClassCount = NULL;
+static fn_ImageGetClass       p_ImageGetClass = NULL;
+static fn_ClassGetName        p_ClassGetName = NULL;
+static fn_ClassGetNamespace   p_ClassGetNamespace = NULL;
+static fn_ClassGetMethod      p_ClassGetMethod = NULL;
+static fn_ClassGetField       p_ClassGetField = NULL;
+static fn_ClassGetType        p_ClassGetType = NULL;
+static fn_TypeGetObject       p_TypeGetObject = NULL;
+static fn_ThreadAttach        p_ThreadAttach = NULL;
+static fn_ThreadCurrent       p_ThreadCurrent = NULL;
+static fn_RuntimeInvoke       p_RuntimeInvoke = NULL;
+static fn_FieldGetValue       p_FieldGetValue = NULL;
+static fn_ArrayNew            p_ArrayNew = NULL;
 
+#define GETSYM(var, name) if (!(var)) (var) = reinterpret_cast<decltype(var)>(dlsym(g_il2cppHandle, name));
+
+static bool LoadIl2Cpp() {
+    if (g_il2cppHandle) return true;
+    g_il2cppHandle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_il2cppHandle) {
+        FILE* f = fopen("/proc/self/maps", "r");
+        if (f) {
+            char line[1024];
+            while (fgets(line, sizeof(line), f)) {
+                if (!strstr(line, "libil2cpp.so")) continue;
+                const char* sp = strrchr(line, '/');
+                if (!sp) continue;
+                char path[1024];
+                size_t n = strcspn(sp, " \n");
+                if (n >= sizeof(path)) continue;
+                memcpy(path, sp, n);
+                path[n] = 0;
+                g_il2cppHandle = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+                if (!g_il2cppHandle) g_il2cppHandle = dlopen(path, RTLD_NOW);
+                if (g_il2cppHandle) break;
+            }
+            fclose(f);
+        }
+    }
+    if (g_il2cppHandle) LogF("libil2cpp.so loaded");
+    return g_il2cppHandle != NULL;
+}
+
+// resolved classes/methods/fields
 static void* g_texClass = NULL;
 static void* g_objClass = NULL;
-static void* g_typeClass = NULL;
-static void* g_resClass = NULL;
-static void* g_color32Class = NULL;
-static void* g_byteClass = NULL;
 static void* g_imgConvClass = NULL;
+static void* g_byteClass = NULL;
+static void* g_color32Class = NULL;
 
-static void* g_findAll = NULL;    // Object.FindObjectsOfTypeAll(Type)
-static void* g_typeMeth = NULL;   // Type.GetTypeFromName(string)
-static void* g_getName = NULL;    // Object.GetName()
-static void* g_apply0 = NULL;     // Texture2D.Apply()
-static void* g_load1 = NULL;      // ImageConversion.LoadImage(byte[])
-static void* g_rawLoad = NULL;    // Texture2D.LoadRawTextureData(byte[])
-static void* g_setPix32 = NULL;   // Texture2D.SetPixels32(Color32[])
-static void* g_nameField = NULL;
-static void* g_widthField = NULL;
-static void* g_heightField = NULL;
-static void* g_formatField = NULL;
+static void* g_getNameM   = NULL; // UnityEngine.Object::GetName()
+static void* g_findAllM   = NULL; // UnityEngine.Object::FindObjectsOfTypeAll(Type)
+static void* g_applyM     = NULL; // Texture2D::Apply()
+static void* g_loadImageM = NULL; // ImageConversion::LoadImage(byte[])   (path 1)
+static void* g_loadRawM   = NULL; // Texture2D::LoadRawTextureData(byte[]) (path 2)
+static void* g_setPix32M  = NULL; // Texture2D::SetPixels32(Color32[])     (path 3)
+static void* g_getWM      = NULL; // Texture2D::get_width()
+static void* g_getHM      = NULL; // Texture2D::get_height()
+static void* g_nameField  = NULL; // UnityEngine.Object::m_Name (optional)
+
+static void* g_texTypeObj = NULL;
 
 static volatile bool g_injectEnabled = true;
-static long g_applied = 0;
-static long g_passNo = 0;
+static volatile bool g_running = true;
+static Il2CppDomain* g_domain = NULL;
 
-#define GETSYM(var, name) if (!(var)) (var) = reinterpret_cast<decltype(var)>(dlsym(g_handle, name));
-
-// ==================== утилиты ====================
-static std::string Utf16ToUtf8(const unsigned short* s, unsigned long long len) {
-    std::string out;
-    out.reserve((size_t)len);
-    for (unsigned long long i = 0; i < len; i++) {
-        unsigned short c = s[i];
-        if (c < 0x80) out.push_back((char)c);
-        else if (c < 0x800) {
-            out.push_back((char)(0xC0 | (c >> 6)));
-            out.push_back((char)(0x80 | (c & 0x3F)));
-        } else {
-            out.push_back((char)(0xE0 | (c >> 12)));
-            out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
-            out.push_back((char)(0x80 | (c & 0x3F)));
-        }
-    }
-    return out;
-}
-
-static std::string Il2StrToStd(void* str) {
-    if (!str || !p_StringChars) return std::string();
-    unsigned long long len = 0;
-    unsigned short* chars = p_StringChars(str, &len);
-    if (!chars) return std::string();
-    return Utf16ToUtf8(chars, len);
-}
-
-static unsigned long long ArrayLen(void* arr) {
-    if (!arr) return 0;
-    size_t sz = 0;
-    memcpy(&sz, (char*)arr + 3 * sizeof(void*), sizeof(sz));
-    return (unsigned long long)sz;
-}
-
-static void* ArrayElem(void* arr, unsigned long long i) {
-    if (!arr) return NULL;
-    return *(void**)((char*)arr + 4 * sizeof(void*) + (size_t)i * sizeof(void*));
-}
-
-static std::string SanitizeName(const std::string& in) {
-    std::string out;
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); i++) {
-        char c = in[i];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-            out.push_back(c);
-        else
-            out.push_back('_');
-    }
-    return out;
-}
-
-static bool ReadFileBytes(const std::string& path, std::vector<unsigned char>& out) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
-    long sz = ftell(f);
-    if (sz <= 0 || sz > 64L * 1024L * 1024L) { fclose(f); return false; }
-    fseek(f, 0, SEEK_SET);
-    out.resize((size_t)sz);
-    size_t rd = fread(out.data(), 1, (size_t)sz, f);
-    fclose(f);
-    return rd == (size_t)sz;
-}
-
-// имя текстуры: сначала поле m_Name (без входа в managed-код — безопасно),
-// только если поля нет — invoke GetName с проверкой исключения
-static std::string GetTexName(void* tex) {
-    if (g_nameField && p_FieldGetValue) {
-        void* str = NULL;
-        p_FieldGetValue(tex, g_nameField, &str);
-        std::string s = Il2StrToStd(str);
-        if (!s.empty()) return s;
-    }
-    if (g_getName && p_RuntimeInvoke) {
-        void* exc = NULL;
-        void* ret = p_RuntimeInvoke(g_getName, tex, NULL, &exc);
-        if (!exc && ret) return Il2StrToStd(ret);
-        ClearPending(GetEnv());
-    }
-    return std::string();
-}
-
-// ==================== декод PNG через Android ====================
-static bool JniDecodePngToRgba(JNIEnv* env, const unsigned char* data, size_t len,
-                               int tw, int th, std::vector<unsigned char>& out) {
-    if (!env || !data || len == 0 || tw <= 0 || th <= 0) return false;
-    bool ok = false;
-    jclass bmpCls = env->FindClass("android/graphics/Bitmap");
-    jclass facCls = env->FindClass("android/graphics/BitmapFactory");
-    jmethodID decode = NULL, gw = NULL, gh = NULL, getpix = NULL, recycle = NULL, scale = NULL;
-    jbyteArray jarr = NULL;
-    jintArray jpix = NULL;
-    jobject bmp = NULL;
-    jint* raw = NULL;
-    do {
-        if (!bmpCls || !facCls) break;
-        decode = env->GetStaticMethodID(facCls, "decodeByteArray", "([BII)Landroid/graphics/Bitmap;");
-        gw = env->GetMethodID(bmpCls, "getWidth", "()I");
-        gh = env->GetMethodID(bmpCls, "getHeight", "()I");
-        getpix = env->GetMethodID(bmpCls, "getPixels", "([IIIIIII)V");
-        recycle = env->GetMethodID(bmpCls, "recycle", "()V");
-        scale = env->GetStaticMethodID(bmpCls, "createScaledBitmap",
-                                       "(Landroid/graphics/Bitmap;IIZ)Landroid/graphics/Bitmap;");
-        if (!decode || !gw || !gh || !getpix || !recycle) break;
-        jarr = env->NewByteArray((jsize)len);
-        if (!jarr) break;
-        env->SetByteArrayRegion(jarr, 0, (jsize)len, (const jbyte*)data);
-        bmp = env->CallStaticObjectMethod(facCls, decode, jarr, (jint)0, (jint)len);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); bmp = NULL; }
-        if (!bmp) break;
-        int bw = env->CallIntMethod(bmp, gw);
-        int bh = env->CallIntMethod(bmp, gh);
-        if (bw > 0 && bh > 0 && (bw != tw || bh != th) && scale) {
-            jobject scaled = env->CallStaticObjectMethod(bmpCls, scale, bmp, (jint)tw, (jint)th, (jboolean)JNI_TRUE);
-            if (env->ExceptionCheck()) { env->ExceptionClear(); scaled = NULL; }
-            if (scaled) {
-                if (recycle) env->CallVoidMethod(bmp, recycle);
-                env->DeleteLocalRef(bmp);
-                bmp = scaled;
-            }
-        }
-        jpix = env->NewIntArray(tw * th);
-        if (!jpix) break;
-        env->CallVoidMethod(bmp, getpix, jpix, (jint)0, (jint)tw, (jint)0, (jint)0, (jint)tw, (jint)th);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
-        raw = env->GetIntArrayElements(jpix, NULL);
-        if (!raw) break;
-        out.resize((size_t)tw * (size_t)th * 4);
-        for (int y = 0; y < th; y++) {
-            for (int x = 0; x < tw; x++) {
-                jint p = raw[y * tw + x];
-                unsigned char* d = &out[((size_t)y * (size_t)tw + (size_t)x) * 4];
-                d[0] = (unsigned char)((p >> 16) & 0xFF); // R
-                d[1] = (unsigned char)((p >> 8) & 0xFF);  // G
-                d[2] = (unsigned char)(p & 0xFF);         // B
-                d[3] = (unsigned char)((p >> 24) & 0xFF); // A
-            }
-        }
-        ok = true;
-    } while (0);
-    if (raw && jpix) env->ReleaseIntArrayElements(jpix, raw, JNI_ABORT);
-    if (bmp && recycle) env->CallVoidMethod(bmp, recycle);
-    if (jarr) env->DeleteLocalRef(jarr);
-    if (jpix) env->DeleteLocalRef(jpix);
-    if (bmp) env->DeleteLocalRef(bmp);
-    ClearPending(env);
-    return ok;
-}
-
-// ==================== заливка пикселей ====================
-static bool PushPixels(void* tex, const std::vector<unsigned char>& rgba, int w, int h) {
-    if (!tex || rgba.empty() || !p_ArrayNew || !p_RuntimeInvoke) return false;
-    if (rgba.size() != (size_t)w * (size_t)h * 4) return false;
-    void* exc = NULL;
-    // путь 2: LoadRawTextureData
-    if (g_rawLoad && g_byteClass) {
-        void* arr = p_ArrayNew(g_byteClass, (unsigned long long)rgba.size(), NULL);
-        if (arr) {
-            memcpy((char*)arr + 4 * sizeof(void*), rgba.data(), rgba.size());
-            void* args[1] = { &arr };
-            exc = NULL;
-            p_RuntimeInvoke(g_rawLoad, tex, args, &exc);
-            if (!exc && g_apply0) { exc = NULL; p_RuntimeInvoke(g_apply0, tex, NULL, &exc); }
-            if (!exc) return true;
-            LogMsg("raw push threw");
-        }
-    }
-    // путь 3: SetPixels32
-    if (g_setPix32 && g_color32Class) {
-        void* arr = p_ArrayNew(g_color32Class, (unsigned long long)w * (unsigned long long)h, NULL);
-        if (arr) {
-            memcpy((char*)arr + 4 * sizeof(void*), rgba.data(), rgba.size());
-            void* args[1] = { &arr };
-            exc = NULL;
-            p_RuntimeInvoke(g_setPix32, tex, args, &exc);
-            if (!exc && g_apply0) { exc = NULL; p_RuntimeInvoke(g_apply0, tex, NULL, &exc); }
-            if (!exc) return true;
-            LogMsg("setpix threw");
-        }
-    }
-    return false;
-}
-
-// путь 1: LoadImage (если класс уцелел от стриппинга)
-static bool PushPng(void* tex, const std::vector<unsigned char>& png) {
-    if (!tex || png.empty()) return false;
-    if (g_loadIcall) {
-        void* arr = (g_byteClass && p_ArrayNew) ? p_ArrayNew(g_byteClass, (unsigned long long)png.size(), NULL) : NULL;
-        if (!arr) return false;
-        memcpy((char*)arr + 4 * sizeof(void*), png.data(), png.size());
-        bool r = g_loadIcall(tex, arr, true);
-        void* exc = NULL;
-        if (r && g_apply0) { exc = NULL; p_RuntimeInvoke(g_apply0, tex, NULL, &exc); }
-        return r && !exc;
-    }
-    if (g_load1 && p_RuntimeInvoke) {
-        void* arr = (g_byteClass && p_ArrayNew) ? p_ArrayNew(g_byteClass, (unsigned long long)png.size(), NULL) : NULL;
-        if (!arr) return false;
-        memcpy((char*)arr + 4 * sizeof(void*), png.data(), png.size());
-        void* args[1] = { &arr };
-        void* exc = NULL;
-        p_RuntimeInvoke(g_load1, NULL, args, &exc);
-        if (!exc && g_apply0) { exc = NULL; p_RuntimeInvoke(g_apply0, tex, NULL, &exc); }
-        return !exc;
-    }
-    return false;
-}
-
-// ==================== защитный барьер от SIGSEGV ====================
-static __thread sigjmp_buf g_segvJmp;
-static __thread volatile bool g_segvActive = false;
-static void SegvHandler(int) {
-    if (g_segvActive) siglongjmp(g_segvJmp, 1);
-    _exit(0);
-}
-
-static void InjectPassBody() {
-    if (!p_ThreadAttach || !g_domain) return;
-    p_ThreadAttach(g_domain);
-    if (!g_typeMeth || !g_findAll || !g_texClass || !p_StringNew) return;
-
-    void* sName = p_StringNew("UnityEngine.Texture2D");
-    if (!sName) return;
-    void* argsT[1] = { &sName };
-    void* exc = NULL;
-    void* typeObj = p_RuntimeInvoke(g_typeMeth, NULL, argsT, &exc);
-    if (exc || !typeObj) { LogMsg("type resolve failed"); ClearPending(GetEnv()); return; }
-
-    void* argsF[1] = { &typeObj };
-    exc = NULL;
-    void* arr = p_RuntimeInvoke(g_findAll, NULL, argsF, &exc);
-    if (exc || !arr) { ClearPending(GetEnv()); return; }
-
-    unsigned long long cnt = ArrayLen(arr);
-    JNIEnv* jenv = GetEnv();
-
-    for (unsigned long long i = 0; i < cnt; i++) {
-        void* tex = ArrayElem(arr, i);
-        if (!tex) continue;
-        std::string name = GetTexName(tex);
-        if (name.empty()) continue;
-
-        int w = 0, h = 0;
-        if (g_widthField) p_FieldGetValue(tex, g_widthField, &w);
-        if (g_heightField) p_FieldGetValue(tex, g_heightField, &h);
-        if (w <= 0 || h <= 0 || w > 8192 || h > 8192) continue;
-
-        std::string base = SanitizeName(name);
-        std::vector<unsigned char> bytes;
-        bool isRaw = false;
-        if (ReadFileBytes("/storage/emulated/0/texmod/" + base + ".png", bytes) ||
-            ReadFileBytes("/storage/emulated/0/texmod/" + name + ".png", bytes)) {
-            isRaw = false;
-        } else if (ReadFileBytes("/storage/emulated/0/texmod/" + base + ".rgba", bytes)) {
-            isRaw = true;
-        } else {
-            continue;
-        }
-
-        bool injected = false;
-        if (!isRaw) {
-            if (PushPng(tex, bytes)) {
-                injected = true;
-            } else if (jenv) {
-                std::vector<unsigned char> px;
-                if (JniDecodePngToRgba(jenv, bytes.data(), bytes.size(), w, h, px) &&
-                    PushPixels(tex, px, w, h))
-                    injected = true;
-            }
-        } else {
-            if (bytes.size() == (size_t)w * (size_t)h * 4 && PushPixels(tex, bytes, w, h))
-                injected = true;
-        }
-
-        if (injected) {
-            g_applied++;
-            LogMsg("injected: %s (%dx%d)", name.c_str(), w, h);
-        }
-    }
-    LogMsg("heartbeat: pass=%ld applied=%ld textures=%llu", g_passNo, g_applied, cnt);
-}
-
-static void InjectPass() {
-    struct sigaction sa, old;
-    memset(&sa, 0, sizeof(sa));
-    memset(&old, 0, sizeof(old));
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_ONSTACK | SA_RESTART;
-    sa.sa_handler = SegvHandler;
-    sigaction(SIGSEGV, &sa, &old);
-    if (sigsetjmp(g_segvJmp, 1) != 0) {
-        g_segvActive = false;
-        sigaction(SIGSEGV, &old, NULL);
-        LogMsg("segv caught in inject pass, skipped");
-        return;
-    }
-    g_segvActive = true;
-    do { InjectPassBody(); } while (0);
-    g_segvActive = false;
-    sigaction(SIGSEGV, &old, NULL);
-}
-
-// ==================== резолв il2cpp ====================
 static bool ResolveIl2Cpp() {
-    if (g_domain) return true;
-    if (!g_handle) {
-        g_handle = dlopen("libil2cpp.so", RTLD_NOW);
-        if (!g_handle) return false;
-        LogMsg("libil2cpp.so loaded");
-    }
+    if (!LoadIl2Cpp()) return false;
     GETSYM(p_DomainGet, "il2cpp_domain_get");
     GETSYM(p_DomainGetAssemblies, "il2cpp_domain_get_assemblies");
-    GETSYM(p_ThreadAttach, "il2cpp_thread_attach");
-    GETSYM(p_AssemblyGetImage, "il2cpp_assembly_get_image");
+    GETSYM(p_AsmGetImage, "il2cpp_assembly_get_image");
     GETSYM(p_ImageGetName, "il2cpp_image_get_name");
     GETSYM(p_ImageGetClassCount, "il2cpp_image_get_class_count");
     GETSYM(p_ImageGetClass, "il2cpp_image_get_class");
     GETSYM(p_ClassGetName, "il2cpp_class_get_name");
     GETSYM(p_ClassGetNamespace, "il2cpp_class_get_namespace");
     GETSYM(p_ClassGetMethod, "il2cpp_class_get_method_from_name");
-    GETSYM(p_ClassGetFieldFromName, "il2cpp_class_get_field_from_name");
+    GETSYM(p_ClassGetField, "il2cpp_class_get_field_from_name");
+    GETSYM(p_ClassGetType, "il2cpp_class_get_type");
+    GETSYM(p_TypeGetObject, "il2cpp_type_get_object");
+    GETSYM(p_ThreadAttach, "il2cpp_thread_attach");
+    GETSYM(p_ThreadCurrent, "il2cpp_thread_current");
+    GETSYM(p_RuntimeInvoke, "il2cpp_runtime_invoke");
     GETSYM(p_FieldGetValue, "il2cpp_field_get_value");
     GETSYM(p_ArrayNew, "il2cpp_array_new");
-    GETSYM(p_StringNew, "il2cpp_string_new");
-    GETSYM(p_StringChars, "il2cpp_string_chars");
-    GETSYM(p_RuntimeInvoke, "il2cpp_runtime_invoke");
-    GETSYM(p_ResolveIcall, "il2cpp_resolve_icall");
-    if (!p_DomainGet) return false;
-    if (!g_domain) g_domain = p_DomainGet();
-    if (!g_domain) return false;
-    LogMsg("il2cpp domain ready");
+    if (!p_DomainGet || !p_DomainGetAssemblies || !p_AsmGetImage ||
+        !p_ImageGetClass || !p_ImageGetClassCount || !p_ClassGetMethod) {
+        LogF("il2cpp api incomplete");
+        return false;
+    }
 
-    // ждём стабилизации списка сборок (два одинаковых счётчика подряд)
-    unsigned long long nn = 0, prev = 0;
-    void** asms = NULL;
+    Il2CppDomain* dom = p_DomainGet();
+    if (!dom) return false;
+
+    // wait until the assembly list is stable (two identical counts in a row)
+    size_t n = 0, prev = 0;
+    Il2CppAssembly** asms = NULL;
     for (int tries = 0; tries < 120; tries++) {
-        asms = p_DomainGetAssemblies ? p_DomainGetAssemblies(g_domain, &nn) : NULL;
-        if (asms && nn > 0 && nn == prev) break;
-        prev = nn;
+        asms = p_DomainGetAssemblies(dom, &n);
+        if (asms && n > 0 && n == prev) break;
+        prev = n;
         usleep(100000);
     }
-    return g_domain != NULL;
-}
+    if (!asms || !n) return false;
 
-static void ScanAndResolve() {
-    if (!p_DomainGetAssemblies || !p_ImageGetClassCount || !p_ImageGetClass) return;
-    void** assemblies = NULL;
-    unsigned long long n = 0;
-    assemblies = p_DomainGetAssemblies(g_domain, &n);
-    if (!assemblies || n == 0) return;
+    if (g_texClass) return true; // already resolved
 
-    unsigned long long total = 0;
-    for (unsigned long long i = 0; i < n; i++) {
-        void* image = p_AssemblyGetImage(assemblies[i]);
-        if (!image) continue;
-        const char* imgName = p_ImageGetName(image);
-        LogMsg("asm[%llu]: %s", i, imgName ? imgName : "?");
-        int cnt = p_ImageGetClassCount(image);
-        for (int j = 0; j < cnt; j++) {
-            void* cls = p_ImageGetClass(image, j);
+    LogF("il2cpp domain ready");
+    int scanned = 0;
+    for (size_t a = 0; a < n; a++) {
+        Il2CppImage* img = asms[a] ? p_AsmGetImage(asms[a]) : NULL;
+        if (!img) continue;
+        (void)p_ImageGetName; // image names not needed for class resolution
+        size_t cc = p_ImageGetClassCount(img);
+        for (size_t c = 0; c < cc; c++) {
+            void* cls = p_ImageGetClass(img, c);
             if (!cls) continue;
-            total++;
+            scanned++;
             const char* ns = p_ClassGetNamespace(cls);
             const char* nm = p_ClassGetName(cls);
-            if (!nm) continue;
-            bool isU = ns && strcmp(ns, "UnityEngine") == 0;
-            bool isS = ns && strcmp(ns, "System") == 0;
-            if (isU) {
-                if (!g_texClass && !strcmp(nm, "Texture2D")) g_texClass = cls;
-                else if (!g_objClass && !strcmp(nm, "Object")) g_objClass = cls;
-                else if (!g_typeClass && !strcmp(nm, "Type")) g_typeClass = cls;
-                else if (!g_resClass && !strcmp(nm, "Resources")) g_resClass = cls;
-                else if (!g_color32Class && !strcmp(nm, "Color32")) g_color32Class = cls;
-                else if (!g_imgConvClass && !strcmp(nm, "ImageConversion")) g_imgConvClass = cls;
-            } else if (isS) {
-                if (!g_byteClass && !strcmp(nm, "Byte")) g_byteClass = cls;
+            if (!ns || !nm) continue;
+            if (!strcmp(nm, "Texture2D") && !strcmp(ns, "UnityEngine")) g_texClass = cls;
+            else if (!strcmp(nm, "Object") && !strcmp(ns, "UnityEngine")) g_objClass = cls;
+            else if (!strcmp(nm, "ImageConversion") && !strcmp(ns, "UnityEngine")) g_imgConvClass = cls;
+            else if (!strcmp(nm, "Byte") && !strcmp(ns, "System")) g_byteClass = cls;
+            else if (!strcmp(nm, "Color32") && !strcmp(ns, "UnityEngine")) g_color32Class = cls;
+        }
+    }
+    LogF("classes scanned: %d", scanned);
+
+    if (!g_texClass) { LogF("Texture2D class not found"); return false; }
+
+    if (g_objClass) {
+        g_getNameM = p_ClassGetMethod(g_objClass, "GetName", 0);
+        g_findAllM = p_ClassGetMethod(g_objClass, "FindObjectsOfTypeAll", 1);
+        g_nameField = p_ClassGetField ? p_ClassGetField(g_objClass, "m_Name") : NULL;
+    }
+    g_applyM     = p_ClassGetMethod(g_texClass, "Apply", 0);
+    g_loadRawM   = p_ClassGetMethod(g_texClass, "LoadRawTextureData", 1);
+    g_setPix32M  = p_ClassGetMethod(g_texClass, "SetPixels32", 1);
+    g_getWM      = p_ClassGetMethod(g_texClass, "get_width", 0);
+    g_getHM      = p_ClassGetMethod(g_texClass, "get_height", 0);
+    if (g_imgConvClass) g_loadImageM = p_ClassGetMethod(g_imgConvClass, "LoadImage", 1);
+
+    if (p_ClassGetType && p_TypeGetObject) {
+        void* t = p_ClassGetType(g_texClass);
+        if (t) g_texTypeObj = p_TypeGetObject(t);
+    }
+
+    LogF("resolved: tex=%p obj=%p imgConv=%p findAll=%p getName=%p apply=%p load1=%p",
+         g_texClass, g_objClass, g_imgConvClass, g_findAllM, g_getNameM, g_applyM, g_loadImageM);
+    LogF("fallback: raw=%p set32=%p color32=%p w=%p h=%p nameField=%p",
+         g_loadRawM, g_setPix32M, g_color32Class, g_getWM, g_getHM, g_nameField);
+    return true;
+}
+
+// ============================== JNI helpers ==============================
+
+static JavaVM* g_jvm = NULL;
+typedef int (*fn_GetCreatedJavaVMs)(JavaVM**, int, int*);
+
+static JNIEnv* GetJniEnv() {
+    if (!g_jvm) {
+        fn_GetCreatedJavaVMs f =
+            reinterpret_cast<fn_GetCreatedJavaVMs>(dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
+        if (f) {
+            JavaVM* vms[4] = { NULL, NULL, NULL, NULL };
+            int cnt = 0;
+            if (f(vms, 4, &cnt) == JNI_OK && cnt > 0) g_jvm = vms[0];
+        }
+    }
+    if (!g_jvm) return NULL;
+    JNIEnv* env = NULL;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK && env) return env;
+    env = NULL;
+    if (g_jvm->AttachCurrentThread((void**)&env, NULL) == JNI_OK && env) return env;
+    return NULL;
+}
+
+// il2cpp string -> std::string (Il2CppObject {klass,monitor,len(0x10),chars(0x14)})
+static std::string ToUtf8(void* strObj) {
+    if (!strObj) return "";
+    int len = *(int*)((char*)strObj + 0x10);
+    if (len <= 0 || len > 4096) return "";
+    const char16_t* s = (const char16_t*)((char*)strObj + 0x14);
+    std::string out;
+    out.reserve((size_t)len);
+    for (int i = 0; i < len; i++) {
+        char16_t c = s[i];
+        if (c < 0x80) out += (char)c;
+        else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+        else { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+    }
+    return out;
+}
+
+static int ReadIntInvoke(void* obj, void* method) {
+    if (!obj || !method || !p_RuntimeInvoke) return 0;
+    void* exc = NULL;
+    void* r = p_RuntimeInvoke(method, obj, NULL, &exc);
+    if (exc || !r) return 0;
+    return *(int*)((char*)r + 0x10); // boxed int payload
+}
+
+static std::string GetTexName(void* tex) {
+    if (!tex) return "";
+    // primary: direct field read (no managed call, cannot crash)
+    if (g_nameField && p_FieldGetValue) {
+        void* strObj = NULL;
+        p_FieldGetValue(tex, g_nameField, &strObj);
+        std::string s = ToUtf8(strObj);
+        if (!s.empty()) return s;
+    }
+    // fallback: managed invoke, exception-checked
+    if (g_getNameM && p_RuntimeInvoke) {
+        void* exc = NULL;
+        void* r = p_RuntimeInvoke(g_getNameM, tex, NULL, &exc);
+        if (!exc && r) return ToUtf8(r);
+    }
+    return "";
+}
+
+static bool ReadFile(const std::string& path, std::vector<uint8_t>& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 64 * 1024 * 1024) { fclose(f); return false; }
+    out.resize((size_t)sz);
+    size_t rd = fread(out.data(), 1, out.size(), f);
+    fclose(f);
+    if (rd != out.size()) out.clear();
+    return !out.empty();
+}
+
+static int CountTexmodFiles() {
+    DIR* d = opendir(kTexDir);
+    if (!d) return -1;
+    int cnt = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        cnt++;
+    }
+    closedir(d);
+    return cnt;
+}
+
+static void* MakeByteArray(const std::vector<uint8_t>& data) {
+    if (!g_byteClass || !p_ArrayNew || data.empty()) return NULL;
+    void* arr = p_ArrayNew(g_byteClass, (unsigned long)data.size(), NULL);
+    if (!arr) return NULL;
+    memcpy((char*)arr + 0x20, data.data(), data.size());
+    return arr;
+}
+
+static bool ApplyTex(void* tex) {
+    if (!g_applyM || !p_RuntimeInvoke) return false;
+    void* exc = NULL;
+    p_RuntimeInvoke(g_applyM, tex, NULL, &exc);
+    if (exc) { LogF("apply exc"); return false; }
+    return true;
+}
+
+// PNG -> RGBA via Android BitmapFactory (works even when Unity stripping removed LoadImage)
+static bool DecodePngToRgba(JNIEnv* env, const std::vector<uint8_t>& png, int tw, int th, std::vector<uint8_t>& out) {
+    if (!env || png.empty() || tw <= 0 || th <= 0 || tw * th > 8192 * 8192) return false;
+    bool ok = false;
+    jclass fCls = NULL, bCls = NULL;
+    jbyteArray jarr = NULL;
+    jintArray jintArr = NULL;
+    jint* ibuf = NULL;
+    jobject bmp = NULL, scaled = NULL;
+    jmethodID decodeM = NULL, scaleM = NULL, getPixM = NULL, recycleM = NULL;
+    do {
+        fCls = env->FindClass("android/graphics/BitmapFactory");
+        if (!fCls || env->ExceptionCheck()) { if (fCls) env->ExceptionClear(); break; }
+        decodeM = env->GetStaticMethodID(fCls, "decodeByteArray", "([BII)Landroid/graphics/Bitmap;");
+        if (!decodeM) break;
+        jarr = env->NewByteArray((jsize)png.size());
+        if (!jarr) break;
+        env->SetByteArrayRegion(jarr, 0, (jsize)png.size(), (const jbyte*)png.data());
+        bmp = env->CallStaticObjectMethod(fCls, decodeM, jarr, 0, (jint)png.size());
+        if (!bmp || env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        bCls = env->FindClass("android/graphics/Bitmap");
+        if (!bCls || env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        scaleM = env->GetStaticMethodID(bCls, "createScaledBitmap",
+                                        "(Landroid/graphics/Bitmap;IIZ)Landroid/graphics/Bitmap;");
+        if (!scaleM) break;
+        scaled = env->CallStaticObjectMethod(bCls, scaleM, bmp, (jint)tw, (jint)th, JNI_TRUE);
+        if (!scaled || env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        getPixM = env->GetMethodID(bCls, "getPixels", "([IIIII)V");
+        if (!getPixM) break;
+        jintArr = env->NewIntArray(tw * th);
+        if (!jintArr) break;
+        env->CallObjectMethod(scaled, getPixM, jintArr, 0, (jint)tw, 0, 0, (jint)tw, (jint)th);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        jsize plen = env->GetArrayLength(jintArr);
+        if (plen != tw * th) break;
+        ibuf = (jint*)malloc((size_t)plen * sizeof(jint));
+        if (!ibuf) break;
+        env->GetIntArrayRegion(jintArr, 0, plen, ibuf);
+        out.resize((size_t)tw * (size_t)th * 4);
+        for (jsize i = 0; i < plen; i++) {
+            unsigned v = (unsigned)ibuf[i];
+            out[(size_t)i * 4 + 0] = (uint8_t)((v >> 16) & 0xFF); // R
+            out[(size_t)i * 4 + 1] = (uint8_t)((v >> 8) & 0xFF);  // G
+            out[(size_t)i * 4 + 2] = (uint8_t)(v & 0xFF);         // B
+            out[(size_t)i * 4 + 3] = (uint8_t)((v >> 24) & 0xFF); // A
+        }
+        ok = true;
+    } while (false);
+    recycleM = bCls ? env->GetMethodID(bCls, "recycle", "()V") : NULL;
+    if (recycleM) {
+        if (bmp)    env->CallObjectMethod(bmp, recycleM);
+        if (scaled) env->CallObjectMethod(scaled, recycleM);
+    }
+    if (bmp) env->DeleteLocalRef(bmp);
+    if (scaled) env->DeleteLocalRef(scaled);
+    if (jarr) env->DeleteLocalRef(jarr);
+    if (jintArr) env->DeleteLocalRef(jintArr);
+    free(ibuf);
+    return ok;
+}
+
+// ============================== inject ==============================
+
+static std::set<std::string> g_done;
+static bool Done(const std::string& n) { return g_done.count(n) != 0; }
+static void MarkDone(const std::string& n) { g_done.insert(n); }
+
+static bool InjectOne(JNIEnv* env, void* tex, const std::string& name) {
+    if (!tex || name.empty() || !p_RuntimeInvoke) return false;
+    int w = ReadIntInvoke(tex, g_getWM);
+    int h = ReadIntInvoke(tex, g_getHM);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return false;
+
+    std::string fname = name;
+    for (size_t i = 0; i < fname.size(); i++)
+        if (fname[i] == ' ' || fname[i] == '/' || fname[i] == '\\') fname[i] = '_';
+
+    std::vector<uint8_t> png, raw;
+    bool havePng = ReadFile(std::string(kTexDir) + "/" + fname + ".png", png);
+    bool haveRaw = ReadFile(std::string(kTexDir) + "/" + fname + ".rgba", raw);
+    if (!havePng && !haveRaw) return false;
+
+    void* exc = NULL;
+
+    // path 1: ImageConversion.LoadImage(byte[])
+    if (havePng && g_loadImageM) {
+        void* barr = MakeByteArray(png);
+        if (barr) {
+            void* args[1] = { barr };
+            exc = NULL;
+            void* r = p_RuntimeInvoke(g_loadImageM, NULL, args, &exc);
+            bool okRes = !exc && r && *(unsigned char*)((char*)r + 0x10) != 0;
+            if (okRes && ApplyTex(tex)) { LogF("injected(loadimage): %s", name.c_str()); return true; }
+            if (exc) LogF("loadimage exc: %s", name.c_str());
+        }
+    }
+
+    // path 2: BitmapFactory decode -> LoadRawTextureData(byte[])
+    if (havePng && g_loadRawM) {
+        std::vector<uint8_t> rgba;
+        if (DecodePngToRgba(env, png, w, h, rgba) && rgba.size() == (size_t)w * (size_t)h * 4) {
+            void* barr = MakeByteArray(rgba);
+            if (barr) {
+                void* args[1] = { barr };
+                exc = NULL;
+                void* r = p_RuntimeInvoke(g_loadRawM, tex, args, &exc);
+                bool okRes = !exc && r && *(unsigned char*)((char*)r + 0x10) != 0;
+                if (okRes && ApplyTex(tex)) { LogF("injected(raw): %s", name.c_str()); return true; }
+                if (exc) LogF("raw exc: %s", name.c_str());
             }
         }
     }
-    LogMsg("classes scanned: %llu", total);
 
-    if (g_objClass) {
-        g_getName = p_ClassGetMethod(g_objClass, "GetName", 0);
-        g_findAll = p_ClassGetMethod(g_objClass, "FindObjectsOfTypeAll", 1);
-        g_nameField = p_ClassGetFieldFromName(g_objClass, "m_Name");
+    // path 3: SetPixels32(Color32[])
+    if (g_setPix32M && g_color32Class) {
+        const std::vector<uint8_t>* pix = NULL;
+        std::vector<uint8_t> tmp;
+        if (haveRaw && raw.size() == (size_t)w * (size_t)h * 4) pix = &raw;
+        else if (havePng && DecodePngToRgba(env, png, w, h, tmp) && tmp.size() == (size_t)w * (size_t)h * 4) pix = &tmp;
+        if (pix) {
+            void* carr = p_ArrayNew(g_color32Class, (unsigned long)(w * h), NULL);
+            if (carr) {
+                memcpy((char*)carr + 0x20, pix->data(), pix->size());
+                void* args[1] = { carr };
+                exc = NULL;
+                p_RuntimeInvoke(g_setPix32M, tex, args, &exc);
+                if (!exc && ApplyTex(tex)) { LogF("injected(setpixels32): %s", name.c_str()); return true; }
+                if (exc) LogF("setpixels32 exc: %s", name.c_str());
+            }
+        }
     }
-    if (g_typeClass) g_typeMeth = p_ClassGetMethod(g_typeClass, "GetTypeFromName", 1);
-    if (g_resClass) p_ClassGetMethod(g_resClass, "Load", 1);
-    if (g_texClass) {
-        g_apply0 = p_ClassGetMethod(g_texClass, "Apply", 0);
-        g_rawLoad = p_ClassGetMethod(g_texClass, "LoadRawTextureData", 1);
-        g_setPix32 = p_ClassGetMethod(g_texClass, "SetPixels32", 1);
-        g_widthField = p_ClassGetFieldFromName(g_texClass, "m_Width");
-        g_heightField = p_ClassGetFieldFromName(g_texClass, "m_Height");
-        g_formatField = p_ClassGetFieldFromName(g_texClass, "m_Format");
-    }
-    if (g_imgConvClass) g_load1 = p_ClassGetMethod(g_imgConvClass, "LoadImage", 1);
-    if (p_ResolveIcall)
-        g_loadIcall = reinterpret_cast<fn_LoadImageIcall>(
-            p_ResolveIcall("UnityEngine.ImageConversion::LoadImage(System.Byte[],System.Boolean)"));
-
-    LogMsg("resolved: tex=%p res=%p imgConv=%p findAll=%p getName=%p apply0=%p load3=%p load1=%p icall=%p",
-           (void*)g_texClass, (void*)g_resClass, (void*)g_imgConvClass, (void*)g_findAll,
-           (void*)g_getName, (void*)g_apply0, (void*)g_setPix32, (void*)g_load1, (void*)g_loadIcall);
-    LogMsg("fallback: color32=%p set32=%p raw=%p byte=%p w=%p h=%p",
-           (void*)g_color32Class, (void*)g_setPix32, (void*)g_rawLoad,
-           (void*)g_byteClass, (void*)g_widthField, (void*)g_heightField);
+    return false;
 }
 
-// ==================== рабочий поток ====================
-static void* TexThread(void*) {
-    for (int i = 0; i < 240; i++) {
-        if (ResolveIl2Cpp()) break;
-        usleep(500000);
+static void RunPass() {
+    if (!g_texClass && !ResolveIl2Cpp()) return;
+    if (!g_injectEnabled) return;
+
+    // il2cpp requires every native thread to be attached before API calls
+    if (p_ThreadAttach && g_domain) p_ThreadAttach(g_domain);
+
+    JNIEnv* env = GetJniEnv();
+    if (!env) { static bool warned = false; if (!warned) { LogF("no jni env"); warned = true; } return; }
+
+    if (!g_texTypeObj || !g_findAllM) return;
+    void* args1[1] = { g_texTypeObj };
+    void* exc = NULL;
+    void* arrObj = p_RuntimeInvoke(g_findAllM, NULL, args1, &exc);
+    if (exc) { LogF("findAll threw"); return; }
+    if (!arrObj) return;
+
+    unsigned count = *(unsigned*)((char*)arrObj + 0x18); // il2cpp array max_length
+    if (count > 20000) count = 20000;
+    void** items = (void**)((char*)arrObj + 0x20);       // il2cpp array data
+
+    int applied = 0;
+    for (unsigned i = 0; i < count; i++) {
+        void* tex = items[i];
+        if (!tex) continue;
+        std::string name = GetTexName(tex);
+        if (name.empty()) continue;
+        if (Done(name)) continue;
+        if (InjectOne(env, tex, name)) { MarkDone(name); applied++; }
     }
-    if (!g_domain) { LogMsg("il2cpp not found, giving up"); return NULL; }
-    ScanAndResolve();
-    while (true) {
-        if (g_injectEnabled) {
-            g_passNo++;
-            InjectPass();
+    LogF("heartbeat: files=%d applied=%d", CountTexmodFiles(), applied);
+}
+
+// ============================== SIGSEGV barrier ==============================
+// The crash we chased: our worker thread null-derefs inside libil2cpp
+// (fault addr 0x135) and kills the game. The barrier now covers the WHOLE
+// worker thread loop, so any such fault is logged and skipped instead.
+
+static __thread sigjmp_buf g_segvJmp;
+static __thread bool g_segvActive = false;
+
+static void SegvHandler(int sig, siginfo_t*, void*) {
+    if (g_segvActive) siglongjmp(g_segvJmp, 1);
+    signal(sig, SIG_DFL); // unrelated crash: restore default and re-raise
+    raise(sig);
+}
+
+static void InstallSegv() {
+    stack_t ss;
+    ss.ss_sp = malloc(SIGSTKSZ);
+    ss.ss_size = SIGSTKSZ;
+    ss.ss_flags = 0;
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = SegvHandler;
+    sigaction(SIGSEGV, &sa, NULL);
+}
+
+// ============================== worker thread ==============================
+
+static void* WorkerThread(void*) {
+    InstallSegv();
+    LogF("mod start (inject build)");
+
+    {
+        FILE* probe = fopen(kLogPath, "a");
+        LogF(probe ? "storage access OK" : "storage access FAIL");
+        if (probe) fclose(probe);
+    }
+
+    int segvStreak = 0;
+    while (g_running) {
+        bool crashed = false;
+        if (sigsetjmp(g_segvJmp, 1) != 0) {
+            // jump target: a SIGSEGV inside any il2cpp call of this pass
+            g_segvActive = false;
+            crashed = true;
+            segvStreak++;
+            LogF("segv caught in mod thread, pass skipped (%d)", segvStreak);
+            if (segvStreak >= 3) {
+                LogF("too many segvs, inject passes paused");
+                g_injectEnabled = false; // stop hammering a poisoned state
+            }
         } else {
-            LogMsg("heartbeat: pass=%ld applied=%ld (disabled)", g_passNo, g_applied);
+            g_segvActive = true;
+            RunPass();
+            g_segvActive = false;
+            segvStreak = 0;
         }
-        sleep(10);
+        int waitSec = crashed ? 10 : 5;
+        for (int i = 0; i < waitSec && g_running; i++) usleep(100000);
     }
     return NULL;
 }
 
-__attribute__((constructor)) static void TexModInit() {
-    LogMsg("mod start (inject-only build)");
-    if (access("/storage/emulated/0/texmod", F_OK) == 0)
-        LogMsg("storage access OK");
-    else
-        LogMsg("texmod dir missing, create /storage/emulated/0/texmod");
+__attribute__((constructor))
+static void MainInit() {
     pthread_t t;
-    if (pthread_create(&t, NULL, TexThread, NULL) == 0) pthread_detach(t);
+    if (pthread_create(&t, NULL, WorkerThread, NULL) == 0) pthread_detach(t);
 }
 
-// ==================== меню (сигнатуры строго из Menu.hpp) ====================
+// ============================== mod menu API ==============================
+
 jobjectArray GetFeatureList(JNIEnv* env, jobject context) {
-    ClearPending(env);
     (void)context;
-    const char* features[] = {
+    if (!env) return NULL;
+    jstring sample = env->NewStringUTF("");
+    jclass strCls = env->GetObjectClass(sample);
+    env->DeleteLocalRef(sample);
+    const char* feats[2] = {
         OBFUSCATE("Category_Textures"),
         OBFUSCATE("0_Toggle_Inject Textures"),
     };
-    int total = (int)(sizeof features / sizeof features[0]);
-    jclass strCls = env->FindClass("java/lang/String");
-    if (!strCls) { ClearPending(env); return NULL; }
-    jobjectArray ret = env->NewObjectArray(total, strCls, env->NewStringUTF(""));
-    if (!ret || env->ExceptionCheck()) { ClearPending(env); return NULL; }
-    for (int i = 0; i < total; i++)
-        env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
-    ClearPending(env);
-    return ret;
+    jobjectArray arr = env->NewObjectArray(2, strCls, env->NewStringUTF(""));
+    for (int i = 0; i < 2; i++) env->SetObjectArrayElement(arr, i, env->NewStringUTF(feats[i]));
+    return arr;
 }
 
 void Changes(JNIEnv* env, jclass clazz, jobject obj,
              jint featNum, jstring featName, jint value, jlong Lvalue,
              jboolean boolean, jstring str) {
-    ClearPending(env);
-    (void)clazz; (void)obj; (void)value; (void)Lvalue; (void)str;
-    if (featName) {
-        const char* n = env->GetStringUTFChars(featName, NULL);
-        if (n) {
-            LogMsg("change: num=%d name=%s", featNum, n);
-            env->ReleaseStringUTFChars(featName, n);
-        }
+    (void)clazz; (void)obj; (void)value; (void)Lvalue; (void)str; (void)featNum;
+    if (!env || !featName) return;
+    const char* fn = env->GetStringUTFChars(featName, NULL);
+    bool match = fn && strstr(fn, OBFUSCATE("Inject Textures")) != NULL;
+    if (fn) env->ReleaseStringUTFChars(featName, fn);
+    if (match) {
+        g_injectEnabled = (boolean == JNI_TRUE);
+        LogF("inject enabled: %d", (int)g_injectEnabled);
     }
-    if (featNum == 0) {
-        g_injectEnabled = (boolean != JNI_FALSE);
-        LogMsg("inject enabled: %d", g_injectEnabled ? 1 : 0);
-    }
-    ClearPending(env);
 }
